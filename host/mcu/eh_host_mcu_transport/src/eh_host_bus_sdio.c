@@ -290,6 +290,8 @@ static uint32_t sdio_rx_slot_drops;   /* overrun drops; should stay 0 */
 static uint16_t sdio_rx_stream_drops;
 static uint16_t sdio_rx_phantom_reads;
 #define SDIO_RX_POST_RESUME_SETTLE_MS  0
+/* Retry interval while the RX staging buffer cannot be allocated */
+#define SDIO_RX_BUF_RETRY_MS  10
 
 static void * sdio_rx_buf_thread;
 static void sdio_data_to_rx_buf_task(void *pvParameters);
@@ -1662,10 +1664,18 @@ static void sdio_read_task(void *pvParameters)
 
 		rxbuff = sdio_rx_get_buffer(len_from_slave);
 		if (!rxbuff) {
-			ESP_LOGW(TAG, "rx_get_buffer(%lu) failed; skipping read",
+			/* The NEW_PACKET interrupt for this data is already cleared, and the
+			 * slave raises no new one while the data stays unread: skipping the
+			 * read would stall RX for good. Wait for memory and read it then. */
+			ESP_LOGW(TAG, "rx_get_buffer(%lu) failed; waiting for memory",
 			         (unsigned long)len_from_slave);
 			SDIO_DRV_UNLOCK();
-			continue;
+			while (s_running && !(rxbuff = sdio_rx_get_buffer(len_from_slave)))
+				eh_host_port_task_delay_ms(SDIO_RX_BUF_RETRY_MS);
+			if (!rxbuff)
+				continue;
+			ESP_LOGW(TAG, "rx_get_buffer(%lu) succeeded again", (unsigned long)len_from_slave);
+			SDIO_DRV_LOCK();
 		}
 
 		data_left = len_from_slave;
