@@ -116,6 +116,7 @@ eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t
 eh_host_port_err_t eh_host_port_task_create_pinned(const eh_host_port_task_create_cfg_t *cfg,
                                    eh_host_port_task_t **out, int core)
 {
+    if (core != tskNO_AFFINITY && (core < 0 || core >= portNUM_PROCESSORS)) return EH_HOST_PORT_ERR_INVAL;
     return task_create_on_core(cfg, out, (BaseType_t)core);
 }
 
