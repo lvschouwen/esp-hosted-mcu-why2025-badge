@@ -113,6 +113,14 @@ eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t
     return EH_HOST_PORT_OK;
 }
 
+/* No core affinity on POSIX: `core` is ignored. */
+eh_host_port_err_t eh_host_port_task_create_pinned(const eh_host_port_task_create_cfg_t *cfg,
+                                   eh_host_port_task_t **out, int core)
+{
+    (void)core;
+    return eh_host_port_task_create(cfg, out);
+}
+
 eh_host_port_err_t eh_host_port_task_join(eh_host_port_task_t *task)
 {
     if (!task) return EH_HOST_PORT_ERR_INVAL;
