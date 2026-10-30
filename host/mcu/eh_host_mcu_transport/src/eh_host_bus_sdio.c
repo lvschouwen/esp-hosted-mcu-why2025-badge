@@ -76,7 +76,8 @@ static void *eh_sdio_thread_create(const char *name, int prio, size_t stack,
         .priority = prio, .name = name,
     };
     eh_host_port_task_t *t = NULL;
-    if (eh_host_port_task_create(&cfg, &t) != EH_HOST_PORT_OK) return NULL;
+    /* Core 0 talks to the world; core 1 is left to the UI. */
+    if (eh_host_port_task_create_pinned(&cfg, &t, 0) != EH_HOST_PORT_OK) return NULL;
     return (void *)t;
 }
 
