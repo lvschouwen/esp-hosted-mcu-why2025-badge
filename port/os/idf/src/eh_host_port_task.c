@@ -56,8 +56,8 @@ static void trampoline(void *p)
     }
 }
 
-eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t *cfg,
-                                   eh_host_port_task_t **out)
+static eh_host_port_err_t task_create_on_core(const eh_host_port_task_create_cfg_t *cfg,
+                                              eh_host_port_task_t **out, BaseType_t core)
 {
     if (!cfg || !cfg->fn) return EH_HOST_PORT_ERR_INVAL;
     if (cfg->flags & ~(uint32_t)EH_HOST_PORT_TASK_DETACHED) return EH_HOST_PORT_ERR_INVAL;
@@ -88,11 +88,11 @@ eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t
      * MUST be torn down with vTaskDeleteWithCaps (handled in trampoline
      * and _cancel). */
     t->with_caps = 1;
-    ok = xTaskCreateWithCaps(trampoline, name, depth, t, prio, &t->handle,
-                             MALLOC_CAP_SPIRAM);
+    ok = xTaskCreateWithCapsPinnedToCore(trampoline, name, depth, t, prio, &t->handle,
+                                         core, MALLOC_CAP_SPIRAM);
 #else
     t->with_caps = 0;
-    ok = xTaskCreate(trampoline, name, depth, t, prio, &t->handle);
+    ok = xTaskCreatePinnedToCore(trampoline, name, depth, t, prio, &t->handle, core);
 #endif
     if (ok != pdPASS) {
         /* Task never started, so `t` is still ours to free (it isn't detached-
@@ -104,6 +104,19 @@ eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t
     /* Detached task owns `t` on success; it may already be freed. */
     if (out) *out = t;
     return EH_HOST_PORT_OK;
+}
+
+eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t *cfg,
+                                   eh_host_port_task_t **out)
+{
+    return task_create_on_core(cfg, out, tskNO_AFFINITY);
+}
+
+/* IDF only: same as _create but pinned to `core` (the SDIO bus threads). */
+eh_host_port_err_t eh_host_port_task_create_pinned(const eh_host_port_task_create_cfg_t *cfg,
+                                   eh_host_port_task_t **out, int core)
+{
+    return task_create_on_core(cfg, out, (BaseType_t)core);
 }
 
 eh_host_port_err_t eh_host_port_task_join(eh_host_port_task_t *task)

@@ -44,6 +44,10 @@ typedef struct {
 eh_host_port_err_t eh_host_port_task_create(const eh_host_port_task_create_cfg_t *cfg,
                                    eh_host_port_task_t **out);
 
+/* ESP-IDF port only: like _create, pinned to `core`. */
+eh_host_port_err_t eh_host_port_task_create_pinned(const eh_host_port_task_create_cfg_t *cfg,
+                                   eh_host_port_task_t **out, int core);
+
 /* Block until the task's entry function has returned.  Must be called
  * before `_destroy`.  A task that has already exited returns immediately
  * with EH_HOST_PORT_OK. */

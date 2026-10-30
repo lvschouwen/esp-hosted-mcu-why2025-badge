@@ -55,7 +55,7 @@ int eh_rpc_tx_start(void)
         .fn = tx_worker, .arg = NULL,
         .stack_bytes = 0, .priority = 0, .name = "eh_rpc_tx",
     };
-    if (eh_host_port_task_create(&tcfg, &g_tx_thread) != EH_HOST_PORT_OK) {
+    if (eh_host_port_task_create_pinned(&tcfg, &g_tx_thread, 0) != EH_HOST_PORT_OK) {
         ESP_LOGD("eh_host_feat_rpc", "tx_start: task_create failed");
         return -1;
     }
