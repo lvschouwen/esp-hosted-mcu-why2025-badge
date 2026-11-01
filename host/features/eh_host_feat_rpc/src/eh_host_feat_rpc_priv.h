@@ -37,6 +37,8 @@ typedef struct {
 eh_rpc_ctx_t *eh_rpc_ctx(void);
 bool          eh_rpc_is_ready(void);
 bool          eh_rpc_is_inactive(void);
+/* The transport reported a failure and has not come back: no reply can arrive. */
+bool          eh_rpc_link_failed(void);
 void          eh_rpc_set_state(int state);
 
 int  eh_rpc_tx_init(uint32_t depth);
@@ -110,6 +112,10 @@ int  eh_rpc_evt_dispatch(int32_t msg_id, const void *ctrl_cmd);
  * (MCU host is memory-constrained). Raising requires a spec update. */
 #ifndef EH_RPC_DEFAULT_QUEUE_DEPTH
 #define EH_RPC_DEFAULT_QUEUE_DEPTH 16u
+#endif
+/* A sync wait wakes this often to give up early once the transport fails. */
+#ifndef EH_RPC_SYNC_POLL_MS
+#define EH_RPC_SYNC_POLL_MS 50u
 #endif
 #ifndef EH_RPC_MAX_SYNC_TXN
 #define EH_RPC_MAX_SYNC_TXN 16u

@@ -162,6 +162,7 @@ static void eh_uart_rx_task(void *arg)
     uint8_t *acc = malloc(cap);
     if (!acc) {
         ESP_LOGE(TAG, "accumulator alloc failed, exiting");
+        eh_host_mcu_transport_state_set_failed();
         esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
         eh_host_port_restart_host();
@@ -279,6 +280,7 @@ fail_drv:
 fail:
     if (s_bus_lock) { eh_host_port_mutex_destroy(s_bus_lock); s_bus_lock = NULL; }
     eh_frame_deinit();
+    eh_host_mcu_transport_state_set_failed();
     esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
         eh_host_port_restart_host();

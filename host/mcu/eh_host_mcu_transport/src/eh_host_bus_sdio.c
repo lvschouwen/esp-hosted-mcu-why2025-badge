@@ -645,6 +645,7 @@ static int sdio_is_write_buffer_available(uint32_t buf_needed)
 
 				if (!max_retry_sdio_not_responding) {
 					ESP_LOGE(TAG, "%s: SDIO slave unresponsive", __func__);
+					eh_host_mcu_transport_state_set_failed();
 					esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 					eh_host_port_restart_host();
@@ -907,6 +908,7 @@ static void sdio_tx_aggregate_iter(void)
 						continue;
 					SDIO_DRV_UNLOCK();
 					ESP_LOGE(TAG, "SDIO aggr: unrecoverable write failure");
+					eh_host_mcu_transport_state_set_failed();
 					esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 					eh_host_port_restart_host();
@@ -1085,6 +1087,7 @@ static void sdio_write_streaming_iter(void)
 				} else {
 					SDIO_DRV_UNLOCK();
 					ESP_LOGE(TAG, "Unrecoverable host sdio state");
+					eh_host_mcu_transport_state_set_failed();
 					esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 					eh_host_port_restart_host();
@@ -1594,6 +1597,7 @@ static void sdio_read_task(void *pvParameters)
 
 				SDIO_DRV_UNLOCK();
 				if (s_running) {
+					eh_host_mcu_transport_state_set_failed();
 					esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 					eh_host_port_restart_host();
@@ -1610,6 +1614,7 @@ static void sdio_read_task(void *pvParameters)
 
 				SDIO_DRV_UNLOCK();
 				if (s_running) {
+					eh_host_mcu_transport_state_set_failed();
 					esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 					eh_host_port_restart_host();
@@ -1649,6 +1654,7 @@ static void sdio_read_task(void *pvParameters)
 			 * zero-length. Post the event and (optionally) restart — don't retry. */
 			SDIO_DRV_UNLOCK();
 			if (s_running) {
+				eh_host_mcu_transport_state_set_failed();
 				esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 				eh_host_port_restart_host();

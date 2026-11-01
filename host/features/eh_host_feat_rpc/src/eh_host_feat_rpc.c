@@ -11,6 +11,7 @@
 int eh_host_wait_auto_init_ready(uint32_t timeout_ms);
 #if CONFIG_ESP_HOSTED_HOST_TYPE_MCU
 int eh_host_mcu_transport_state_is_tx_ready(void);
+int eh_host_mcu_transport_state_is_failed(void);
 #endif
 
 static eh_rpc_ctx_t g_eh_rpc_ctx;
@@ -27,6 +28,15 @@ static bool eh_rpc_link_ready(void)
     return eh_rpc_is_ready() && eh_host_mcu_transport_state_is_tx_ready();
 #else
     return eh_rpc_is_ready();
+#endif
+}
+
+bool eh_rpc_link_failed(void)
+{
+#if CONFIG_ESP_HOSTED_HOST_TYPE_MCU
+    return eh_host_mcu_transport_state_is_failed() != 0;
+#else
+    return false;
 #endif
 }
 
@@ -51,7 +61,7 @@ static int eh_rpc_wait_ready(uint32_t timeout_ms)
 
     uint64_t deadline = (uint64_t)(esp_timer_get_time() / 1000) + timeout_ms;
     while (!eh_rpc_link_ready()) {
-        if (eh_rpc_is_inactive()) {
+        if (eh_rpc_is_inactive() || eh_rpc_link_failed()) {
             return -1;
         }
         if ((uint64_t)(esp_timer_get_time() / 1000) >= deadline) {
@@ -240,6 +250,10 @@ int eh_host_feat_rpc_send(int32_t msg_id, void *app_req)
         ESP_LOGD("eh_host_feat_rpc", "send: app_req is NULL");
         return -1;
     }
+    if (eh_rpc_link_failed()) {
+        ESP_LOGW("eh_host_feat_rpc", "send: transport down, msg_id=%" PRId32 " not sent", msg_id);
+        return -1;
+    }
     if (!eh_rpc_link_ready() && eh_rpc_wait_ready(EH_RPC_READY_WAIT_MS) != 0) {
         ESP_LOGD("eh_host_feat_rpc", "send: rpc not ready (wait timeout=%" PRIu32 " ms)",
                    EH_RPC_READY_WAIT_MS);
@@ -257,6 +271,17 @@ int eh_host_feat_rpc_request(int32_t msg_id, void *app_req,
     }
     if (!app_req) {
         ESP_LOGD("eh_host_feat_rpc", "request: app_req is NULL");
+        return -1;
+    }
+    /* No reply can come over a failed transport: fail now rather than after the
+     * full response timeout (the slave was reset or lost). */
+    if (eh_rpc_link_failed()) {
+        ESP_LOGW("eh_host_feat_rpc", "request: transport down, msg_id=%" PRId32 " failed at once", msg_id);
+        /* Async rc=-1 contract: LL has freed app_req. */
+        const eh_host_rpc_proto_ops_t *po = eh_rpc_ctx()->proto_ops;
+        if (((eh_rpc_ctrl_cmd_prefix_t *)app_req)->rpc_rsp_cb && po && po->free_ctrl_cmd) {
+            po->free_ctrl_cmd(app_req);
+        }
         return -1;
     }
     if (!eh_rpc_link_ready() && eh_rpc_wait_ready(EH_RPC_READY_WAIT_MS) != 0) {
@@ -309,8 +334,8 @@ int eh_host_feat_rpc_request(int32_t msg_id, void *app_req,
     if (wrc != 0) {
         /* No response within the deadline — the caller sees ESP_FAIL; name the
          * request so a stuck/slow peer is attributable rather than a bare -1. */
-        ESP_LOGW("eh_host_feat_rpc", "request: no response uid=%" PRIu32 " msg_id=%" PRId32 " (%" PRIu32 " ms)",
-                 uid, msg_id, effective_ms);
+        ESP_LOGW("eh_host_feat_rpc", "request: no response uid=%" PRIu32 " msg_id=%" PRId32 " (%" PRIu32 " ms%s)",
+                 uid, msg_id, effective_ms, eh_rpc_link_failed() ? ", cut short: transport down" : "");
     }
     return wrc;
 }

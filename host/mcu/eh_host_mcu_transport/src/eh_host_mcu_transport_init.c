@@ -101,6 +101,9 @@ void eh_host_mcu_transport_dispatch_frame(const interface_buffer_handle_t *h)
 {
     if (!h || !h->payload || !h->payload_len) return;
 
+    /* The slave is talking again: a failure reported earlier was transient. */
+    eh_host_mcu_transport_state_note_rx();
+
     if ((h->flags & FLAG_WAKEUP_PKT) && h->payload_len < 1500) {
         ESP_LOGW("eh_dispatch", "Host wakeup triggered, if_type: %u, len: %u",
                     (unsigned int)h->if_type, (unsigned int)h->payload_len);

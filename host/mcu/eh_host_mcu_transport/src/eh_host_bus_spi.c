@@ -363,6 +363,7 @@ static void eh_spi_gpio_isr_uninstall(void)
 /* Transport bring-up failed: notify the host and (optionally) restart to recover. */
 static void eh_spi_transport_failed(void)
 {
+    eh_host_mcu_transport_state_set_failed();
     esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
     eh_host_port_restart_host();

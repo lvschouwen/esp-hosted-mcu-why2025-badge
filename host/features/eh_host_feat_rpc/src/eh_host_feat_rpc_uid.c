@@ -150,7 +150,22 @@ int eh_rpc_sync_wait(uint32_t uid, uint32_t timeout_ms, void **out_ctrl_cmd)
         return -1;
     }
 
-    int rc = eh_host_port_sem_wait_ms(sem, timeout_ms);
+    /* Wait in slices so a transport failure reported while this request is in
+     * flight ends the wait early; a forever/zero wait is a single call. */
+    int rc;
+    uint32_t left = timeout_ms;
+    for (;;) {
+        bool sliced = left != EH_HOST_PORT_WAIT_FOREVER && left > EH_RPC_SYNC_POLL_MS;
+        uint32_t slice = sliced ? EH_RPC_SYNC_POLL_MS : left;
+        rc = eh_host_port_sem_wait_ms(sem, slice);
+        if (rc == EH_HOST_PORT_OK || !sliced) {
+            break;
+        }
+        left -= slice;
+        if (eh_rpc_link_failed()) {
+            break;
+        }
+    }
 
     void *ctrl_cmd = NULL;
     eh_host_port_mutex_lock(g_sync_pay_mtx);
