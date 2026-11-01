@@ -115,6 +115,9 @@ void eh_host_mcu_transport_dispatch_frame(const interface_buffer_handle_t *h)
 {
     if (!h || !h->payload || !h->payload_len) return;
 
+    /* The slave is talking again: a failure reported earlier was transient. */
+    eh_host_mcu_transport_state_note_rx();
+
     /* Wi-Fi first: most of the traffic. */
     if (h->if_type == ESP_STA_IF || h->if_type == ESP_AP_IF) {
         eh_host_channel_t *chan = eh_host_transport_get_channel(h->if_type);

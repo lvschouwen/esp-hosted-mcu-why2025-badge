@@ -17,6 +17,7 @@
 #include "esp_event.h"
 #include "eh_host_event.h"
 #include "eh_host_mcu_transport_priv.h"
+#include "eh_host_mcu_transport_state.h"
 #include "eh_frame.h"
 #include "eh_host_mcu_hci_internal.h"
 #include "eh_common_header.h"
@@ -439,6 +440,7 @@ static void eh_spihd_rx_task(void *arg)
         ESP_LOGE(TAG, "rx/reg buf alloc failed, exiting");
         if (rx_buf)  eh_host_port_dma_free(rx_buf);
         if (reg_buf) eh_host_port_dma_free(reg_buf);
+        eh_host_mcu_transport_state_set_failed();
         esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
             eh_host_port_restart_host();
@@ -495,6 +497,7 @@ static void eh_spihd_rx_task(void *arg)
                      (unsigned int)size_to_xfer, EH_SPIHD_MAX_BUF);
             s_rx_desync = true;
             eh_host_port_mutex_unlock(s_bus_lock);
+            eh_host_mcu_transport_state_set_failed();
             esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
             eh_host_port_restart_host();
@@ -678,6 +681,7 @@ fail:
     if (s_dr_sem)   { eh_host_port_sem_destroy(s_dr_sem);   s_dr_sem   = NULL; }
     if (s_bus_lock) { eh_host_port_mutex_destroy(s_bus_lock); s_bus_lock = NULL; }
     eh_frame_deinit();
+    eh_host_mcu_transport_state_set_failed();
     esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
             eh_host_port_restart_host();

@@ -655,6 +655,8 @@ static void sdio_link_failed(const char *why)
 	ESP_LOGE(TAG, "%s", why);
 	if (!s_running)
 		return;
+	/* RPC fails fast while this latch is set (Lichen #90) */
+	eh_host_mcu_transport_state_set_failed();
 	esp_event_post(EH_HOST_EVENT, (int32_t)EH_HOST_EVENT_TRANSPORT_FAILURE, NULL, 0, 0);
 #if EH_HOST_TRANSPORT_RESTART_ON_FAILURE
 	eh_host_port_restart_host();
