@@ -1118,7 +1118,10 @@ static void sdio_write_task(void *pvParameters)
 {
 	(void)pvParameters;
 
-	while (!sdio_start_write_thread)
+	/* Also leave when the bus is torn down before the slave ever signalled TX
+	 * ready (failed bring-up): bus_deinit_internal joins this thread and
+	 * would otherwise block forever. */
+	while (s_running && !sdio_start_write_thread)
 		eh_host_port_task_delay_ms(10);
 
 	while (s_running) {
