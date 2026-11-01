@@ -284,6 +284,8 @@ int eh_host_feat_rpc_request(int32_t msg_id, void *app_req,
         }
         return -1;
     }
+    /* Note: unlike the fast-fail above, this return leaves an async app_req
+     * unfreed despite the async rc=-1 contract (pre-existing). */
     if (!eh_rpc_link_ready() && eh_rpc_wait_ready(EH_RPC_READY_WAIT_MS) != 0) {
         ESP_LOGD("eh_host_feat_rpc", "request: rpc not ready (wait timeout=%" PRIu32 " ms)",
                    EH_RPC_READY_WAIT_MS);

@@ -10,6 +10,7 @@ add_library(eh_host_feat_rpc STATIC
     "src/eh_host_feat_rpc_tx.c"
     "src/eh_host_feat_rpc_rx.c"
     "src/eh_host_feat_rpc_uid.c"
+    "src/eh_host_feat_rpc_slice.c"
     "src/eh_host_feat_rpc_evt.c"
 )
 

@@ -20,6 +20,17 @@ int esp_hosted_deinit(void)
     return eh_host_deinit();
 }
 
+#if CONFIG_ESP_HOSTED_HOST_TYPE_MCU
+void eh_host_mcu_transport_state_set_failed(void);
+#endif
+
+void esp_hosted_mark_transport_down(void)
+{
+#if CONFIG_ESP_HOSTED_HOST_TYPE_MCU
+    eh_host_mcu_transport_state_set_failed();
+#endif
+}
+
 int esp_hosted_connect_to_slave(void)
 {
     return eh_host_connect_to_slave();
