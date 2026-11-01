@@ -36,6 +36,13 @@ typedef struct esp_hosted_transport_config esp_hosted_config_t;
 int esp_hosted_init(void);
 int esp_hosted_deinit(void);
 
+/* The application knows the co-processor was reset or lost (e.g. it saw the
+ * reset line go low) before the bus noticed: RPCs fail at once instead of
+ * waiting out their response timeout, as after TRANSPORT_FAILURE. The next
+ * deinit/init (or any frame from the co-processor) clears it. No-op on hosts
+ * without the MCU transport. */
+void esp_hosted_mark_transport_down(void);
+
 int esp_hosted_connect_to_slave(void);
 int esp_hosted_get_coprocessor_fwversion(esp_hosted_coprocessor_fwver_t *ver_info);
 int esp_hosted_get_cp_info(uint32_t *cp_chip_id, char *cp_target_name, size_t cp_target_name_len);

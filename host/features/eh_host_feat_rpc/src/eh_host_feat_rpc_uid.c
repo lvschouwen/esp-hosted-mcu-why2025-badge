@@ -6,6 +6,9 @@
 #include <string.h>
 
 #include "eh_host_feat_rpc_priv.h"
+#include "eh_host_feat_rpc_slice.h"
+
+_Static_assert(EH_RPC_WAIT_FOREVER == EH_HOST_PORT_WAIT_FOREVER, "forever must match the port");
 
 static uint32_t             g_uid;
 static eh_host_port_mutex_t       *g_uid_mtx;
@@ -151,18 +154,21 @@ int eh_rpc_sync_wait(uint32_t uid, uint32_t timeout_ms, void **out_ctrl_cmd)
     }
 
     /* Wait in slices so a transport failure reported while this request is in
-     * flight ends the wait early; a forever/zero wait is a single call. */
+     * flight ends the wait early (a forever wait too); a zero wait is one poll. */
     int rc;
     uint32_t left = timeout_ms;
     for (;;) {
-        bool sliced = left != EH_HOST_PORT_WAIT_FOREVER && left > EH_RPC_SYNC_POLL_MS;
-        uint32_t slice = sliced ? EH_RPC_SYNC_POLL_MS : left;
+        bool more;
+        uint32_t slice = eh_rpc_next_slice(&left, EH_RPC_SYNC_POLL_MS, &more);
         rc = eh_host_port_sem_wait_ms(sem, slice);
-        if (rc == EH_HOST_PORT_OK || !sliced) {
+        if (rc == EH_HOST_PORT_OK || !more) {
             break;
         }
-        left -= slice;
         if (eh_rpc_link_failed()) {
+            /* A response may have landed just now: take it, don't drop it. */
+            if (eh_host_port_sem_wait_ms(sem, 0) == EH_HOST_PORT_OK) {
+                rc = EH_HOST_PORT_OK;
+            }
             break;
         }
     }
@@ -187,6 +193,12 @@ int eh_rpc_sync_wait(uint32_t uid, uint32_t timeout_ms, void **out_ctrl_cmd)
     eh_host_port_mutex_unlock(g_sync_mtx);
 
     eh_host_port_sem_destroy(sem);
+
+    /* post() stashes the payload before it signals: a response stashed by the
+     * time the wait ended is a success, not a timeout the caller would leak. */
+    if (rc != EH_HOST_PORT_OK && ctrl_cmd) {
+        rc = EH_HOST_PORT_OK;
+    }
 
     if (out_ctrl_cmd) {
         *out_ctrl_cmd = ctrl_cmd;
