@@ -59,8 +59,10 @@ static uint8_t *tx_frame_alloc(uint8_t if_type, size_t total, void (**free_fn)(v
         }
     }
     *free_fn = eh_host_port_dma_free;
-    /* MUST be DMA-capable; sdmmc/SPI master reject non-DMA buffers. */
-    return (uint8_t *)eh_host_port_dma_alloc(total);
+    /* PSRAM first only where the bus copies the frame before any DMA (SDIO
+     * STREAM, see eh_host_frame_pool.h); otherwise DMA-capable internal RAM,
+     * which sdmmc/SPI master need for a buffer they DMA from. */
+    return (uint8_t *)eh_host_frame_tx_heap_alloc(total);
 }
 
 esp_err_t eh_host_transport_tx(uint8_t if_type, uint8_t if_num,

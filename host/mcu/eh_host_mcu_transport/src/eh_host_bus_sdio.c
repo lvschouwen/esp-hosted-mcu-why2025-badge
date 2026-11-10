@@ -64,7 +64,10 @@
 #include "eh_host_transport_config.h"
 #include "eh_host_frame_pool.h"
 #include "eh_frame_pool_core.h"
+#ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
+#endif
 
 static volatile uint8_t s_running;
 #if EH_HOST_HOST_USES_STATIC_NETIF
@@ -171,6 +174,60 @@ static void show_config(void)
 #else
 #define SDIO_FRAME_POOLS 0
 #endif
+
+/* Where frame buffers may live (Lichen #121: SDMMC DMA into or out of PSRAM
+ * flips bits at 120 MHz, so nothing in PSRAM may reach an SDIO transfer).
+ * - Every buffer this file hands to an SDIO transfer (TX write buffer, TX
+ *   aggregate, RX staging, register buffer, per-packet TX buffer) comes from
+ *   sdio_dma_alloc_internal / sdio_buffer_alloc: internal DMA RAM, always,
+ *   whatever CONFIG_EH_HOST_PORT_DMA_PREFER_SPIRAM says.
+ * - Frame buffers (pool blocks, per-frame heap copies) only ever meet the CPU:
+ *   TX frames are memcpy'd into the write buffer or the SW_AGGR aggregate, RX
+ *   sub-frames are memcpy'd out of the staging buffer. So they go to PSRAM
+ *   first, and the CPU copy from or to PSRAM goes through the cache coherently,
+ *   with no esp_cache_msync (no DMA ever sees the PSRAM side).
+ * - Only STREAM mode is allowed that: in PACKET mode the RX staging buffer
+ *   itself becomes the frame, so frames are forced internal at compile time.
+ *   SW_AGGR can be negotiated at run time and stays safe (it copies too).
+ *   A zero-copy TX frame, which the per-packet path would DMA from in place,
+ *   is copied into internal RAM when it is in PSRAM (sdio_tx_src_internal). */
+#if SDIO_FRAME_POOLS && defined(EH_HOST_PORT_SDIO_HOST_STREAMING_MODE) && \
+    (EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE)
+#define SDIO_FRAMES_IN_PSRAM 1
+#else
+#define SDIO_FRAMES_IN_PSRAM 0
+#endif
+
+static void *sdio_dma_alloc_internal(size_t n, size_t align)
+{
+#ifdef ESP_PLATFORM
+	return heap_caps_aligned_alloc(align, n,
+	                               MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+#else
+	return eh_host_port_dma_alloc_aligned(n, align);
+#endif
+}
+
+/* A frame copy only the CPU reads or writes: PSRAM first where allowed. */
+static void *sdio_frame_copy_alloc(size_t n)
+{
+#if SDIO_FRAMES_IN_PSRAM && defined(ESP_PLATFORM)
+	void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (p)
+		return p;
+#endif
+	return malloc(n);
+}
+
+static inline bool sdio_ptr_in_psram(const void *p)
+{
+#ifdef ESP_PLATFORM
+	return p && esp_ptr_external_ram(p);
+#else
+	(void)p;
+	return false;
+#endif
+}
 
 #define RX_TASK_STACK_SIZE                EH_HOST_DEFLT_TASK_STACK_BYTES
 #define TX_TASK_STACK_SIZE                EH_HOST_DEFLT_TASK_STACK_BYTES
@@ -322,8 +379,9 @@ static inline void sdio_frame_pools_create(int tx_q_size, int rx_q_size)
 	uint16_t tx_block = (uint16_t)eh_frame_pool_block_bytes(tx_need, HOSTED_MEM_ALIGNMENT);
 	uint16_t rx_block = (uint16_t)eh_frame_pool_block_bytes(MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT);
 
-	eh_host_frame_pools_create((uint16_t)tx_q_size, tx_block, (uint16_t)rx_q_size, rx_block);
-	sdio_tx_stream_buf = eh_host_port_dma_alloc_aligned(MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT);
+	eh_host_frame_pools_create((uint16_t)tx_q_size, tx_block, SDIO_FRAMES_IN_PSRAM,
+	                           (uint16_t)rx_q_size, rx_block, SDIO_FRAMES_IN_PSRAM);
+	sdio_tx_stream_buf = sdio_dma_alloc_internal(MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT);
 	if (!sdio_tx_stream_buf)
 		ESP_LOGW(TAG, "no TX stream buffer: per-frame DMA alloc this link-up");
 #else
@@ -343,9 +401,10 @@ static inline void sdio_frame_pools_destroy(void)
 #endif
 }
 
+/* May be an SDIO DMA buffer (per-packet TX, PACKET-mode RX): internal DMA only. */
 static inline void *sdio_buffer_alloc(unsigned int need_memset)
 {
-	void *p = eh_host_port_dma_alloc(MAX_SDIO_BUFFER_SIZE);
+	void *p = sdio_dma_alloc_internal(MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT);
 	if (p && need_memset) memset(p, 0, MAX_SDIO_BUFFER_SIZE);
 	return p;
 }
@@ -374,8 +433,42 @@ static inline void *sdio_rx_frame_alloc(uint8_t if_type, void (**free_fn)(void *
 #else
 	(void)if_type;
 #endif
+	/* Only the CPU touches a sub-frame copy: PSRAM first (heap_caps_free frees both). */
+	void *p = sdio_frame_copy_alloc(MAX_SDIO_BUFFER_SIZE);
+	if (p)
+		memset(p, 0, MAX_SDIO_BUFFER_SIZE);
 	*free_fn = sdio_buffer_free;
-	return sdio_buffer_alloc(MEMSET_REQUIRED);
+	return p;
+}
+
+/* Lichen #121: the per-packet TX path DMAs straight from a zero-copy frame. If
+ * that frame is in PSRAM, copy it into internal DMA RAM first and release the
+ * caller's buffer. n = header + payload. False when no internal buffer. */
+static bool sdio_tx_src_internal(uint8_t **sendbuf, void (**free_func)(void *), size_t n)
+{
+	if (!sdio_ptr_in_psram(*sendbuf))
+		return true;
+	uint8_t *in = NULL;
+	void (*in_free)(void *) = NULL;
+#if SDIO_FRAME_POOLS
+	if (sdio_tx_stream_buf) {
+		in = sdio_tx_stream_buf;
+		memset(in, 0, MAX_SDIO_BUFFER_SIZE);
+	} else
+#endif
+	{
+		in = sdio_buffer_alloc(MEMSET_REQUIRED);
+		in_free = sdio_buffer_free;
+	}
+	if (in)
+		memcpy(in, *sendbuf, n);
+	else
+		ESP_LOGE(TAG, "PSRAM TX frame and no internal buffer: drop (#121)");
+	if (*free_func)
+		(*free_func)(*sendbuf);
+	*sendbuf   = in;
+	*free_func = in_free;
+	return in != NULL;
 }
 
 static void bus_deinit_internal(void *bus_handle)
@@ -813,7 +906,7 @@ static void sdio_tx_aggregate_iter(void)
 	int pkt_prio = -1;
 
 	if (!sdio_tx_aggr_buf) {
-		sdio_tx_aggr_buf = eh_host_port_dma_alloc_aligned(cap, HOSTED_MEM_ALIGNMENT);
+		sdio_tx_aggr_buf = sdio_dma_alloc_internal(cap, HOSTED_MEM_ALIGNMENT);
 		assert(sdio_tx_aggr_buf);
 		sdio_tx_aggr_cap = cap;
 	}
@@ -1047,6 +1140,10 @@ static void sdio_write_streaming_iter(void)
 					buf_handle.payload_len, MAX_SDIO_BUFFER_SIZE - sizeof(struct esp_payload_header));
 			goto done;
 		}
+
+		if (buf_handle.payload_zcopy &&
+		    !sdio_tx_src_internal(&sendbuf, &free_func, sizeof(struct esp_payload_header) + len))
+			goto done;
 
 		payload_header = (struct esp_payload_header *) sendbuf;
 		payload  = sendbuf + sizeof(struct esp_payload_header);
@@ -1378,7 +1475,7 @@ static uint8_t * sdio_rx_get_buffer(uint32_t len)
 			*buf = NULL;
 			double_buf.buffer[index].buf_size = 0;
 		}
-		*buf = (uint8_t *)eh_host_port_dma_alloc_aligned(len, HOSTED_MEM_ALIGNMENT);
+		*buf = (uint8_t *)sdio_dma_alloc_internal(len, HOSTED_MEM_ALIGNMENT);
 		if (!*buf) {
 			ESP_LOGW(TAG, "dma_alloc(%lu) failed; dropping read",
 			         (unsigned long)len);
@@ -1598,7 +1695,7 @@ static void sdio_read_task(void *pvParameters)
 
 #if DO_COMBINED_REG_READ
     if (!reg_buf) {
-	    reg_buf = eh_host_port_dma_alloc_aligned(REG_BUF_LEN, HOSTED_MEM_ALIGNMENT);
+	    reg_buf = sdio_dma_alloc_internal(REG_BUF_LEN, HOSTED_MEM_ALIGNMENT);
 	    assert(reg_buf);
     }
 #endif
@@ -1840,10 +1937,14 @@ static void sdio_process_rx_task(void *pvParameters)
 					 * CPU (lwIP), never by DMA, so it may live in PSRAM: that keeps
 					 * one internal block per received frame off the DMA heap
 					 * (Lichen #260). Internal heap when PSRAM is full or absent. */
+#ifdef ESP_PLATFORM
 					uint8_t * copy_payload = (uint8_t *)heap_caps_malloc(buf_handle->payload_len,
 							MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 					if (!copy_payload)
 						copy_payload = (uint8_t *)malloc(buf_handle->payload_len);
+#else
+					uint8_t * copy_payload = (uint8_t *)malloc(buf_handle->payload_len);
+#endif
 					assert(buf_handle->payload_len);
 					assert(buf_handle->payload);
 					if (!copy_payload) {

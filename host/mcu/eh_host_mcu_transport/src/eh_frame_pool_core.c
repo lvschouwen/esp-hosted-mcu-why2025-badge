@@ -102,15 +102,24 @@ bool eh_frame_pool_core_close(eh_frame_pool_core_t *c)
 	return true;
 }
 
+static const char *mem_name(uint8_t mem)
+{
+	switch (mem) {
+	case ESP_HOSTED_FRAME_POOL_MEM_PSRAM:    return "psram";
+	case ESP_HOSTED_FRAME_POOL_MEM_INTERNAL: return "internal";
+	default:                                 return "none";
+	}
+}
+
 size_t esp_hosted_frame_pool_fmt(char *out, size_t cap, const char *name,
                                  const esp_hosted_frame_pool_stats_t *s)
 {
 	if (!out || !cap || !s)
 		return 0;
 	int n = snprintf(out, cap,
-		"%s depth %u block %u ram %u in_use %u peak %u waits %lu drops %lu bad_frees %lu no_pool %lu",
+		"%s depth %u block %u ram %u mem %s in_use %u peak %u waits %lu drops %lu bad_frees %lu no_pool %lu",
 		name ? name : "pool", (unsigned)s->depth, (unsigned)s->block,
-		(unsigned)eh_frame_pool_ram_bytes(s->depth, s->block), (unsigned)s->in_use,
+		(unsigned)eh_frame_pool_ram_bytes(s->depth, s->block), mem_name(s->mem), (unsigned)s->in_use,
 		(unsigned)s->peak, (unsigned long)s->waits, (unsigned long)s->drops,
 		(unsigned long)s->bad_frees, (unsigned long)s->no_pool);
 	return n < 0 ? 0 : (size_t)n;
