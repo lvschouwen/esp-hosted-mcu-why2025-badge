@@ -27,6 +27,7 @@ typedef struct {
 	int                           cur;      /* index of the live core, -1 = none */
 	esp_hosted_frame_pool_stats_t st;       /* since boot, across link-ups */
 	uint16_t                      waiters;
+	bool                          psram_ok; /* the bus copies these frames (no DMA) */
 } fp_dir_t;
 
 static fp_dir_t s_dir[DIR_N] = {{.cur = -1}, {.cur = -1}};
@@ -35,15 +36,31 @@ static fp_dir_t s_dir[DIR_N] = {{.cur = -1}, {.cur = -1}};
 static eh_host_port_mutex_t *s_lock;
 static eh_host_port_sem_t   *s_tx_freed;   /* binary: a TX block came back */
 
-static void *block_alloc(size_t bytes)
+static void *block_alloc(size_t bytes, uint8_t mem)
 {
 #ifdef ESP_PLATFORM
+	if (mem == ESP_HOSTED_FRAME_POOL_MEM_PSRAM)
+		return heap_caps_aligned_alloc(HOSTED_MEM_ALIGNMENT, bytes,
+		                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	/* Explicitly internal: eh_host_port_dma_alloc_aligned may prefer PSRAM. */
 	return heap_caps_aligned_alloc(HOSTED_MEM_ALIGNMENT, bytes,
 	                               MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
 #else
+	(void)mem;
 	return eh_host_port_dma_alloc_aligned(bytes, HOSTED_MEM_ALIGNMENT);
 #endif
+}
+
+void *eh_host_frame_tx_heap_alloc(size_t n)
+{
+#ifdef ESP_PLATFORM
+	if (s_dir[DIR_TX].psram_ok) {
+		void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (p)
+			return p;
+	}
+#endif
+	return eh_host_port_dma_alloc(n);
 }
 
 static void blocks_free(void *const *blocks, uint16_t n)
@@ -64,11 +81,11 @@ static bool ensure_sync(void)
 	return s_lock && s_tx_freed;
 }
 
-/* Reserves all blocks or none; called with no lock (allocation can be slow). */
-static bool reserve(void **blocks, uint16_t depth, uint16_t block)
+/* Reserves all blocks in one kind of memory or none; called with no lock. */
+static bool reserve_in(void **blocks, uint16_t depth, uint16_t block, uint8_t mem)
 {
 	for (uint16_t i = 0; i < depth; i++) {
-		blocks[i] = block_alloc(block);
+		blocks[i] = block_alloc(block, mem);
 		if (!blocks[i]) {
 			blocks_free(blocks, i);
 			return false;
@@ -77,13 +94,27 @@ static bool reserve(void **blocks, uint16_t depth, uint16_t block)
 	return true;
 }
 
-static void dir_create(int d, uint16_t depth, uint16_t block)
+/* PSRAM first when allowed, then internal DMA. Returns the memory kind, NONE on failure. */
+static uint8_t reserve(void **blocks, uint16_t depth, uint16_t block, bool psram_ok)
+{
+	if (psram_ok && reserve_in(blocks, depth, block, ESP_HOSTED_FRAME_POOL_MEM_PSRAM))
+		return ESP_HOSTED_FRAME_POOL_MEM_PSRAM;
+	if (reserve_in(blocks, depth, block, ESP_HOSTED_FRAME_POOL_MEM_INTERNAL))
+		return ESP_HOSTED_FRAME_POOL_MEM_INTERNAL;
+	return ESP_HOSTED_FRAME_POOL_MEM_NONE;
+}
+
+static void dir_create(int d, uint16_t depth, uint16_t block, bool psram_ok)
 {
 	void *blocks[EH_FRAME_POOL_MAX_DEPTH] = {0};
 	fp_dir_t *f = &s_dir[d];
 	const char *name = d == DIR_TX ? "tx" : "rx";
+	uint8_t mem = ESP_HOSTED_FRAME_POOL_MEM_NONE;
 
-	if (!depth || depth > EH_FRAME_POOL_MAX_DEPTH || !reserve(blocks, depth, block)) {
+	f->psram_ok = psram_ok;
+	if (depth && depth <= EH_FRAME_POOL_MAX_DEPTH)
+		mem = reserve(blocks, depth, block, psram_ok);
+	if (mem == ESP_HOSTED_FRAME_POOL_MEM_NONE) {
 		ESP_LOGE(TAG, "%s pool %u x %u B not reserved: per-frame heap this link-up",
 		         name, (unsigned)depth, (unsigned)block);
 		eh_host_port_mutex_lock(s_lock);
@@ -98,6 +129,7 @@ static void dir_create(int d, uint16_t depth, uint16_t block)
 		f->cur      = slot;
 		f->st.depth = depth;
 		f->st.block = block;
+		f->st.mem   = mem;
 	} else {
 		f->st.no_pool++;
 	}
@@ -108,19 +140,21 @@ static void dir_create(int d, uint16_t depth, uint16_t block)
 		blocks_free(blocks, depth);
 		return;
 	}
-	ESP_LOGI(TAG, "%s pool: %u x %u B = %u B internal DMA", name, (unsigned)depth,
-	         (unsigned)block, (unsigned)eh_frame_pool_ram_bytes(depth, block));
+	ESP_LOGI(TAG, "%s pool: %u x %u B = %u B %s", name, (unsigned)depth,
+	         (unsigned)block, (unsigned)eh_frame_pool_ram_bytes(depth, block),
+	         mem == ESP_HOSTED_FRAME_POOL_MEM_PSRAM ? "PSRAM" :
+	         psram_ok ? "internal DMA (PSRAM full)" : "internal DMA");
 }
 
-void eh_host_frame_pools_create(uint16_t tx_depth, uint16_t tx_block,
-                                uint16_t rx_depth, uint16_t rx_block)
+void eh_host_frame_pools_create(uint16_t tx_depth, uint16_t tx_block, bool tx_psram,
+                                uint16_t rx_depth, uint16_t rx_block, bool rx_psram)
 {
 	if (!ensure_sync()) {
 		ESP_LOGE(TAG, "no lock for the frame pools: per-frame heap");
 		return;
 	}
-	dir_create(DIR_TX, tx_depth, tx_block);
-	dir_create(DIR_RX, rx_depth, rx_block);
+	dir_create(DIR_TX, tx_depth, tx_block, tx_psram);
+	dir_create(DIR_RX, rx_depth, rx_block, rx_psram);
 }
 
 static void dir_destroy(int d)
@@ -141,6 +175,7 @@ static void dir_destroy(int d)
 		}
 		f->cur      = -1;
 		f->st.depth = 0;
+		f->st.mem   = ESP_HOSTED_FRAME_POOL_MEM_NONE;
 	}
 	eh_host_port_mutex_unlock(s_lock);
 	blocks_free(blocks, n);
