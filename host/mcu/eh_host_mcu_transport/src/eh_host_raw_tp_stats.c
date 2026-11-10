@@ -61,7 +61,13 @@ static void raw_tp_tx_task(void *arg)
      * so an idle engine holds no RAM (eh_host_transport_tx copies it). */
     uint8_t *tx_buf = calloc(1, EH_HOST_PORT_RAW_TP_PKT_LEN);
     if (!tx_buf) {
-        ESP_LOGE(TAG, "No memory for the raw throughput TX buffer");
+        ESP_LOGE(TAG, "No memory for the raw throughput TX buffer, test stopped");
+        /* Stop the whole test: otherwise the timer keeps reporting 0 Kbps */
+        s_test_raw_tp_active = 0;
+        if (s_timer_running && s_raw_tp_timer) {
+            (void)esp_timer_stop(s_raw_tp_timer);
+            s_timer_running = 0;
+        }
         s_tx_task_running = 0;
         return;
     }
