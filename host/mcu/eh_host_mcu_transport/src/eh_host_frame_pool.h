@@ -26,17 +26,12 @@
 #include <stdint.h>
 
 #include "esp_hosted_frame_pool.h"
+#include "eh_frame_pool_core.h"  /* eh_fp_get_t */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef enum {
-	EH_FP_GOT,      /* a pool block */
-	EH_FP_EMPTY,    /* the pool is empty (TX: after the wait); counted as a drop */
-	EH_FP_OFF,      /* no pool this link-up: use the per-frame heap path */
-	EH_FP_TOO_BIG,  /* larger than a block: use the per-frame heap path */
-} eh_fp_get_t;
 
 /* At link-up. *_psram: the bus copies this direction's frames, so its blocks
  * may live in PSRAM (tried first, then internal DMA). A pool whose blocks
@@ -45,9 +40,11 @@ typedef enum {
 void eh_host_frame_pools_create(uint16_t tx_depth, uint16_t tx_block, bool tx_psram,
                                 uint16_t rx_depth, uint16_t rx_block, bool rx_psram);
 
-/* At link-down, after the queues are drained. Blocks still out (a sender
- * between its get and the queue) go back to the retired pool, and its
- * memory is freed with the last one. */
+/* At link-down, after the queues are drained and the bus threads joined.
+ * Free blocks are freed now; blocks still out (a sender between its get and
+ * the queue) are freed as they come back during the next link session, and
+ * any still out after that are left allocated and counted as lost
+ * (eh_frame_pool_dir_retire says why that is the safe choice). */
 void eh_host_frame_pools_destroy(void);
 
 /* TX waits up to wait_ms for a block (backpressure), RX never waits. */
