@@ -75,31 +75,105 @@ eh_frame_pool_put_t eh_frame_pool_core_put(eh_frame_pool_core_t *c, const void *
 	if (i < 0)
 		return EH_FRAME_POOL_PUT_NOT_OURS;
 	uint64_t bit = (uint64_t)1 << i;
-	if (c->free_mask & bit) {
+	if (c->open && (c->free_mask & bit)) {
 		if (s)
 			s->bad_frees++;
 		return EH_FRAME_POOL_PUT_DOUBLE;
 	}
-	c->free_mask |= bit;
 	c->in_use--;
 	if (s && s->in_use)
 		s->in_use--;
-	if (!c->open && !c->in_use) {
-		c->live = false;
-		return EH_FRAME_POOL_PUT_LAST;
+	if (c->open) {
+		c->free_mask |= bit;
+		return EH_FRAME_POOL_PUT_OK;
 	}
-	return EH_FRAME_POOL_PUT_OK;
+	/* Closed: the block leaves the pool, so a second put of it is not ours. */
+	c->block[i] = NULL;
+	if (!c->in_use)
+		c->live = false;
+	return EH_FRAME_POOL_PUT_FREE;
 }
 
-bool eh_frame_pool_core_close(eh_frame_pool_core_t *c)
+uint16_t eh_frame_pool_core_close(eh_frame_pool_core_t *c, void **to_free)
+{
+	uint16_t n = 0;
+	if (!c || !c->live)
+		return 0;
+	c->open = false;
+	for (int i = 0; i < c->depth; i++) {
+		if (c->free_mask & ((uint64_t)1 << i)) {
+			to_free[n++] = c->block[i];
+			c->block[i] = NULL;
+		}
+	}
+	c->free_mask = 0;
+	if (!c->in_use)
+		c->live = false;
+	return n;
+}
+
+uint16_t eh_frame_pool_core_abandon(eh_frame_pool_core_t *c)
 {
 	if (!c || !c->live)
+		return 0;
+	uint16_t n = c->in_use;
+	memset(c, 0, sizeof(*c));
+	return n;
+}
+
+bool eh_frame_pool_dir_install(eh_frame_pool_dir_t *d, void *const *blocks, uint16_t depth,
+                               uint16_t block_bytes, uint8_t mem)
+{
+	if (!d || d->cur.open)
 		return false;
-	c->open = false;
-	if (c->in_use)
+	if (!eh_frame_pool_core_init(&d->cur, blocks, depth, block_bytes))
 		return false;
-	c->live = false;
+	d->st.depth = depth;
+	d->st.block = block_bytes;
+	d->st.mem   = mem;
 	return true;
+}
+
+void *eh_frame_pool_dir_take(eh_frame_pool_dir_t *d, size_t n, eh_fp_get_t *why)
+{
+	if (!d->cur.open) {
+		*why = EH_FP_OFF;
+		return NULL;
+	}
+	if (n > d->cur.block_bytes) {
+		*why = EH_FP_TOO_BIG;
+		return NULL;
+	}
+	void *p = eh_frame_pool_core_take(&d->cur, &d->st);
+	*why = p ? EH_FP_GOT : EH_FP_EMPTY;
+	return p;
+}
+
+bool eh_frame_pool_dir_put(eh_frame_pool_dir_t *d, const void *p)
+{
+	if (!p)
+		return false;   /* like free(NULL) */
+	eh_frame_pool_put_t r = eh_frame_pool_core_put(&d->cur, p, &d->st);
+	if (r == EH_FRAME_POOL_PUT_NOT_OURS)
+		r = eh_frame_pool_core_put(&d->old, p, &d->st);
+	if (r == EH_FRAME_POOL_PUT_NOT_OURS)
+		d->st.bad_frees++;
+	return r == EH_FRAME_POOL_PUT_FREE;
+}
+
+uint16_t eh_frame_pool_dir_retire(eh_frame_pool_dir_t *d, void **to_free)
+{
+	uint16_t lost = eh_frame_pool_core_abandon(&d->old);
+	d->st.lost   += lost;
+	d->st.in_use  = d->st.in_use > lost ? (uint16_t)(d->st.in_use - lost) : 0;
+
+	uint16_t n = eh_frame_pool_core_close(&d->cur, to_free);
+	if (d->cur.live)
+		d->old = d->cur;   /* blocks still out: they return to it */
+	memset(&d->cur, 0, sizeof(d->cur));
+	d->st.depth = 0;
+	d->st.mem   = ESP_HOSTED_FRAME_POOL_MEM_NONE;
+	return n;
 }
 
 static const char *mem_name(uint8_t mem)
@@ -117,10 +191,11 @@ size_t esp_hosted_frame_pool_fmt(char *out, size_t cap, const char *name,
 	if (!out || !cap || !s)
 		return 0;
 	int n = snprintf(out, cap,
-		"%s depth %u block %u ram %u mem %s in_use %u peak %u waits %lu drops %lu bad_frees %lu no_pool %lu",
+		"%s depth %u block %u ram %u mem %s in_use %u peak %u waits %lu drops %lu bad_frees %lu "
+		"lost %lu no_pool %lu",
 		name ? name : "pool", (unsigned)s->depth, (unsigned)s->block,
 		(unsigned)eh_frame_pool_ram_bytes(s->depth, s->block), mem_name(s->mem), (unsigned)s->in_use,
 		(unsigned)s->peak, (unsigned long)s->waits, (unsigned long)s->drops,
-		(unsigned long)s->bad_frees, (unsigned long)s->no_pool);
+		(unsigned long)s->bad_frees, (unsigned long)s->lost, (unsigned long)s->no_pool);
 	return n < 0 ? 0 : (size_t)n;
 }

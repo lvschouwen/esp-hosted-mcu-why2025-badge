@@ -29,6 +29,7 @@ typedef struct {
 	uint32_t waits;      /* TX: the pool was empty and the sender waited */
 	uint32_t drops;      /* TX: still empty after the wait; RX: frame dropped */
 	uint32_t bad_frees;  /* a free of a block that was not handed out */
+	uint32_t lost;       /* blocks never returned a link session after their link-down (leaked) */
 	uint32_t no_pool;    /* link-ups that could not reserve the pool */
 	uint8_t  mem;        /* esp_hosted_frame_pool_mem_t of the live pool */
 } esp_hosted_frame_pool_stats_t;
@@ -36,7 +37,7 @@ typedef struct {
 /* A snapshot of the TX (tx = true) or RX pool. False when pools are off. */
 bool esp_hosted_frame_pool_stats(bool tx, esp_hosted_frame_pool_stats_t *out);
 
-/* "<name> depth 10 block 1600 ram 16000 mem psram in_use 0 peak 7 waits 3 drops 0 bad_frees 0 no_pool 0";
+/* "<name> depth 10 block 1600 ram 16000 mem psram in_use 0 peak 7 waits 3 drops 0 bad_frees 0 lost 0 no_pool 0";
  * returns the length written (snprintf rules). */
 size_t esp_hosted_frame_pool_fmt(char *out, size_t cap, const char *name,
                                  const esp_hosted_frame_pool_stats_t *s);

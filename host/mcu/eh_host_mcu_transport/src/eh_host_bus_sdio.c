@@ -423,6 +423,9 @@ static inline void *sdio_rx_frame_alloc(uint8_t if_type, void (**free_fn)(void *
 	if (if_type == ESP_STA_IF || if_type == ESP_AP_IF) {
 		eh_fp_get_t why = EH_FP_OFF;
 		void *p = eh_host_frame_pool_rx_get(MAX_SDIO_BUFFER_SIZE, &why);
+		/* Not zeroed, unlike the heap path: the caller copies the whole
+		 * sub-frame (header + payload, len + offset bytes) over its start, and
+		 * nothing downstream reads past payload + payload_len. */
 		if (why == EH_FP_GOT) {
 			*free_fn = eh_host_frame_pool_rx_put;
 			return p;
