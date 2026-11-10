@@ -62,6 +62,9 @@
 #include "eh_host_mcu_transport_priv.h"
 #include "eh_host_mcu_transport_state.h"
 #include "eh_host_transport_config.h"
+#include "eh_host_frame_pool.h"
+#include "eh_frame_pool_core.h"
+#include "esp_heap_caps.h"
 
 static volatile uint8_t s_running;
 #if EH_HOST_HOST_USES_STATIC_NETIF
@@ -166,6 +169,16 @@ static void show_config(void)
 #define MIN_MEMPOOL_REQ (MIN_MEMPOOL_BT_PACKETS + MIN_MEMPOOL_SERIAL_PACKETS + MIN_MEMPOOL_NET_PACKETS)
 #endif
 
+/* Fixed Wi-Fi frame pools (Lichen #260), sized by the TX/RX queue depths so a
+ * queue can never fill before its pool runs dry. Upstream's SDIO mempool
+ * (EH_HOST_PORT_SDIO_USE_MEMPOOL) is the alternative; Lichen keeps it off. */
+#ifdef CONFIG_ESP_HOSTED_HOST_SDIO_FRAME_POOLS
+#define SDIO_FRAME_POOLS 1
+#define SDIO_TX_POOL_WAIT_MS  CONFIG_ESP_HOSTED_HOST_SDIO_TX_POOL_WAIT_MS
+#else
+#define SDIO_FRAME_POOLS 0
+#endif
+
 #define RX_TASK_STACK_SIZE                EH_HOST_DEFLT_TASK_STACK_BYTES
 #define TX_TASK_STACK_SIZE                EH_HOST_DEFLT_TASK_STACK_BYTES
 #define PROCESS_RX_TASK_STACK_SIZE        EH_HOST_DEFLT_TASK_STACK_BYTES
@@ -224,6 +237,12 @@ static uint32_t  sdio_tx_aggr_cap = 0;
 
 #if EH_HOST_PORT_SDIO_USE_MEMPOOL
 static struct hosted_mempool *buf_mp_g;
+#endif
+
+#if SDIO_FRAME_POOLS
+/* Per-packet TX DMA buffer, reserved at link-up instead of one malloc per frame
+ * (only one write is in flight: the write task is the only user). */
+static uint8_t *sdio_tx_stream_buf = NULL;
 #endif
 
 
@@ -317,7 +336,7 @@ static void sdio_rx_free_buffer(uint8_t *buf);
 static int sdio_prealloc_pending_rx_slots(void);
 #endif
 
-static inline void sdio_mempool_create(int tx_q_size, int rx_q_size)
+static inline void sdio_frame_pools_create(int tx_q_size, int rx_q_size)
 {
 #if EH_HOST_PORT_SDIO_USE_MEMPOOL
 	size_t num_blocks = (size_t)rx_q_size + MIN_MEMPOOL_REQ;
@@ -331,18 +350,36 @@ static inline void sdio_mempool_create(int tx_q_size, int rx_q_size)
 	assert(buf_mp_g);
 	ESP_LOGI(TAG, "SDIO mempool: %u blocks x %u bytes",
 	         (unsigned)num_blocks, (unsigned)MAX_SDIO_BUFFER_SIZE);
+#elif SDIO_FRAME_POOLS
+	/* A TX frame carries the larger (V2) header in front of the payload. */
+	size_t hdr = EH_ESP_PAYLOAD_HEADER_V2_OFFSET > EH_ESP_PAYLOAD_HEADER_OFFSET ?
+		EH_ESP_PAYLOAD_HEADER_V2_OFFSET : EH_ESP_PAYLOAD_HEADER_OFFSET;
+	size_t tx_need = hdr + MAX_PAYLOAD_SIZE;
+	uint16_t tx_block = (uint16_t)eh_frame_pool_block_bytes(tx_need, HOSTED_MEM_ALIGNMENT);
+	uint16_t rx_block = (uint16_t)eh_frame_pool_block_bytes(MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT);
+
+	eh_host_frame_pools_create((uint16_t)tx_q_size, tx_block, (uint16_t)rx_q_size, rx_block);
+	sdio_tx_stream_buf = eh_host_port_dma_alloc_aligned(MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT);
+	if (!sdio_tx_stream_buf)
+		ESP_LOGW(TAG, "no TX stream buffer: per-frame DMA alloc this link-up");
 #else
 	(void)tx_q_size;
 	(void)rx_q_size;
 #endif
 }
 
-static inline void sdio_mempool_destroy(void)
+static inline void sdio_frame_pools_destroy(void)
 {
 #if EH_HOST_PORT_SDIO_USE_MEMPOOL
 	ESP_LOGD(TAG, "Destroying SDIO mempool");
 	hosted_mempool_destroy(buf_mp_g);
 	buf_mp_g = NULL;
+#elif SDIO_FRAME_POOLS
+	eh_host_frame_pools_destroy();
+	if (sdio_tx_stream_buf) {
+		eh_host_port_dma_free(sdio_tx_stream_buf);
+		sdio_tx_stream_buf = NULL;
+	}
 #endif
 }
 
@@ -354,7 +391,6 @@ static inline void *sdio_buffer_alloc(unsigned int need_memset)
 	void *p = eh_host_port_dma_alloc(MAX_SDIO_BUFFER_SIZE);
 	if (p && need_memset) memset(p, 0, MAX_SDIO_BUFFER_SIZE);
 	return p;
-#endif
 }
 
 static inline void sdio_buffer_free(void *buf)
@@ -363,7 +399,29 @@ static inline void sdio_buffer_free(void *buf)
 	hosted_mempool_free(buf_mp_g, buf);
 #else
 	if (buf) eh_host_port_dma_free(buf);
+}
+
+/* A buffer for one received sub-frame and the free that matches it. Wi-Fi data
+ * comes from the RX pool and is dropped (and counted) when the pool is empty,
+ * never waited for; control frames and the no-pool case use the heap. */
+static inline void *sdio_rx_frame_alloc(uint8_t if_type, void (**free_fn)(void *))
+{
+#if SDIO_FRAME_POOLS
+	if (if_type == ESP_STA_IF || if_type == ESP_AP_IF) {
+		eh_fp_get_t why = EH_FP_OFF;
+		void *p = eh_host_frame_pool_rx_get(MAX_SDIO_BUFFER_SIZE, &why);
+		if (why == EH_FP_GOT) {
+			*free_fn = eh_host_frame_pool_rx_put;
+			return p;
+		}
+		if (why == EH_FP_EMPTY)
+			return NULL;
+	}
+#else
+	(void)if_type;
 #endif
+	*free_fn = sdio_buffer_free;
+	return sdio_buffer_alloc(MEMSET_REQUIRED);
 }
 
 static void bus_deinit_internal(void *bus_handle)
@@ -488,7 +546,7 @@ static void bus_deinit_internal(void *bus_handle)
 	mempool_oom_logged = false;
 	sdio_start_write_thread = false;
 
-	sdio_mempool_destroy();
+	sdio_frame_pools_destroy();
 #if EH_HOST_HOST_USES_STATIC_NETIF
 	if (s_netif_sta) {
 		esp_netif_destroy(s_netif_sta);
@@ -1015,8 +1073,18 @@ static void sdio_write_streaming_iter(void)
 #endif
 
 		if (!buf_handle.payload_zcopy) {
-			sendbuf = sdio_buffer_alloc(MEMSET_REQUIRED);
-			free_func = sdio_buffer_free;
+#if SDIO_FRAME_POOLS
+			if (sdio_tx_stream_buf) {
+				/* Zeroed like a fresh buffer: block-only writes send the tail. */
+				sendbuf = sdio_tx_stream_buf;
+				memset(sendbuf, 0, MAX_SDIO_BUFFER_SIZE);
+				free_func = NULL;
+			} else
+#endif
+			{
+				sendbuf = sdio_buffer_alloc(MEMSET_REQUIRED);
+				free_func = sdio_buffer_free;
+			}
 		} else {
 			sendbuf = buf_handle.payload;
 			free_func = buf_handle.free_buf_handle;
@@ -1227,7 +1295,8 @@ static int is_valid_sdio_rx_packet(uint8_t *rxbuff_a, uint16_t *len_a, uint16_t 
 	return 1;
 }
 
-static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t offset)
+static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t offset,
+		void (*free_fn)(void *))
 {
 	uint8_t pkt_prio = PRIO_Q_OTHERS;
 	struct esp_payload_header *h= NULL;
@@ -1238,7 +1307,7 @@ static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t
 	memset(&buf_handle, 0, sizeof(interface_buffer_handle_t));
 
 	buf_handle.priv_buffer_handle = rxbuff;
-	buf_handle.free_buf_handle    = sdio_buffer_free;
+	buf_handle.free_buf_handle    = free_fn;
 	buf_handle.payload_len        = len;
 	buf_handle.if_type            = h->if_type;
 	buf_handle.if_num             = h->if_num;
@@ -1254,7 +1323,7 @@ static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t
 
 	if( (!from_slave_queue[pkt_prio]) || (!sem_from_slave_queue)) {
 		ESP_LOGI(TAG, "uninitialised from_slave_queue or sem_from_slave_queue");
-		sdio_buffer_free(rxbuff);
+		free_fn(rxbuff);
 		return ESP_FAIL;
 	}
 
@@ -1293,7 +1362,7 @@ static esp_err_t sdio_packet_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 		return ESP_FAIL;
 	}
 
-	if (sdio_push_pkt_to_queue(buf, len, offset)) {
+	if (sdio_push_pkt_to_queue(buf, len, offset, sdio_buffer_free)) {
 		ESP_LOGE(TAG, "Failed to push Rx packet to queue");
 		return ESP_FAIL;
 	}
@@ -1333,7 +1402,8 @@ static esp_err_t sdio_push_aggr_to_queue(uint8_t *buf, uint32_t buf_len)
 			return ESP_FAIL;
 		}
 
-		uint8_t *pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
+		void (*free_fn)(void *) = NULL;
+		uint8_t *pkt_rxbuff = sdio_rx_frame_alloc(dh->if_type, &free_fn);
 		if (!pkt_rxbuff) {
 			if (!mempool_oom_logged) {
 				ESP_LOGD(TAG, "mempool OOM start (RX)");
@@ -1346,7 +1416,7 @@ static esp_err_t sdio_push_aggr_to_queue(uint8_t *buf, uint32_t buf_len)
 				mempool_oom_logged = false;
 			}
 			memcpy(pkt_rxbuff, buf, packet_size);
-			if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset))
+			if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset, free_fn))
 				ESP_LOGI(TAG, "aggr rx: failed to queue sub-frame");
 			subframes++;
 		}
@@ -1442,7 +1512,8 @@ static esp_err_t sdio_streaming_push_data_to_queue(uint8_t * buf, uint32_t buf_l
 			}
 			return ESP_FAIL;
 		}
-		pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
+		void (*free_fn)(void *) = NULL;
+		pkt_rxbuff = sdio_rx_frame_alloc(((struct esp_payload_header *)buf)->if_type, &free_fn);
 		if (!pkt_rxbuff) {
 			if (!mempool_oom_logged) {
 				ESP_LOGW(TAG, "mempool OOM start (RX)");
@@ -1467,12 +1538,12 @@ static esp_err_t sdio_streaming_push_data_to_queue(uint8_t * buf, uint32_t buf_l
 			ESP_LOGE(TAG, "stream-rx size overrun pkt=%lu remaining=%lu",
 					(unsigned long)packet_size,
 					(unsigned long)buf_len);
-			sdio_buffer_free(pkt_rxbuff);
+			free_fn(pkt_rxbuff);
 			return ESP_FAIL;
 		}
 		memcpy(pkt_rxbuff, buf, packet_size);
 
-		if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset)) {
+		if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset, free_fn)) {
 			ESP_LOGI(TAG, "Failed to push a packet to queue from stream");
 		}
 
@@ -1873,8 +1944,14 @@ static void sdio_process_rx_task(void *pvParameters)
 		} else if((buf_handle->if_type == ESP_STA_IF) ||
 				(buf_handle->if_type == ESP_AP_IF)) {
 				if (chan_arr[buf_handle->if_type] && chan_arr[buf_handle->if_type]->rx) {
-					/* TODO: abstract heap_caps_malloc */
-					uint8_t * copy_payload = (uint8_t *)malloc(buf_handle->payload_len);
+					/* The copy handed to the network stack is only read by the
+					 * CPU (lwIP), never by DMA, so it may live in PSRAM: that keeps
+					 * one internal block per received frame off the DMA heap
+					 * (Lichen #260). Internal heap when PSRAM is full or absent. */
+					uint8_t * copy_payload = (uint8_t *)heap_caps_malloc(buf_handle->payload_len,
+							MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+					if (!copy_payload)
+						copy_payload = (uint8_t *)malloc(buf_handle->payload_len);
 					assert(buf_handle->payload_len);
 					assert(buf_handle->payload);
 					if (!copy_payload) {
@@ -2092,7 +2169,7 @@ static void *bus_init_internal(void)
 		assert(to_slave_queue[prio_q_idx]);
 	}
 
-	sdio_mempool_create(tx_queue_size, rx_queue_size);
+	sdio_frame_pools_create(tx_queue_size, rx_queue_size);
 
 	/* SDMMC init must precede thread spawn. */
 	sdio_handle = eh_host_port_sdio_init();

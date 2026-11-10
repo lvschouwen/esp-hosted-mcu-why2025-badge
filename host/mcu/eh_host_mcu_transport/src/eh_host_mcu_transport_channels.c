@@ -21,6 +21,7 @@
 #include "eh_host_port_dma.h"
 #include "eh_frame.h"
 #include "esp_netif_types.h"
+#include "eh_host_frame_pool.h"
 
 #define TAG "eh_chan"
 
@@ -33,13 +34,41 @@ static eh_host_channel_t *aux_chan_arr[ESP_AUX_TYPE_MAX];
 volatile uint32_t wifi_tx_throttling;
 #endif
 
-static inline esp_err_t netif_tx_failed(void)
-{
+/* What lwIP gets when a Wi-Fi frame cannot be queued now: it backs off. */
 #if defined(ESP_ERR_ESP_NETIF_TX_FAILED)
-    return ESP_ERR_ESP_NETIF_TX_FAILED;
+#define EH_TX_BACKOFF_ERR ESP_ERR_ESP_NETIF_TX_FAILED
 #else
-    return ESP_ERR_ESP_NETIF_NO_MEM;
+#define EH_TX_BACKOFF_ERR ESP_ERR_ESP_NETIF_NO_MEM
 #endif
+
+#ifdef CONFIG_ESP_HOSTED_HOST_SDIO_FRAME_POOLS
+#define EH_TX_POOL_WAIT_MS CONFIG_ESP_HOSTED_HOST_SDIO_TX_POOL_WAIT_MS
+#else
+#define EH_TX_POOL_WAIT_MS 0
+#endif
+
+/* A buffer for one outgoing frame and the free that matches it. Wi-Fi data
+ * comes from the TX pool (Lichen #260) and waits a few ms when it is empty;
+ * control frames, and every frame when there is no pool, use the heap. */
+static uint8_t *tx_frame_alloc(uint8_t if_type, size_t total, void (**free_fn)(void *),
+                               esp_err_t *err)
+{
+    *err = ESP_ERR_NO_MEM;
+    if (if_type == ESP_STA_IF || if_type == ESP_AP_IF) {
+        eh_fp_get_t why = EH_FP_OFF;
+        void *p = eh_host_frame_pool_tx_get(total, EH_TX_POOL_WAIT_MS, &why);
+        if (why == EH_FP_GOT) {
+            *free_fn = eh_host_frame_pool_tx_put;
+            return (uint8_t *)p;
+        }
+        if (why == EH_FP_EMPTY) {
+            *err = EH_TX_BACKOFF_ERR;
+            return NULL;
+        }
+    }
+    *free_fn = eh_host_port_dma_free;
+    /* MUST be DMA-capable; sdmmc/SPI master reject non-DMA buffers. */
+    return (uint8_t *)eh_host_port_dma_alloc(total);
 }
 
 static esp_err_t transport_tx(uint8_t if_type, uint8_t if_num, uint8_t pkt_type,
@@ -55,13 +84,14 @@ static esp_err_t transport_tx(uint8_t if_type, uint8_t if_num, uint8_t pkt_type,
 
     if (eh_host_wifi_tx_is_throttled() &&
         (if_type == ESP_STA_IF || if_type == ESP_AP_IF)) {
-        return netif_tx_failed();
+        return EH_TX_BACKOFF_ERR;
     }
 
     size_t total = eh_frame_hdr_size() + payload_len;
-    /* MUST be DMA-capable; sdmmc/SPI master reject non-DMA buffers. */
-    uint8_t *buf = (uint8_t *)eh_host_port_dma_alloc(total);
-    if (!buf) return ESP_ERR_NO_MEM;
+    void (*free_fn)(void *) = NULL;
+    esp_err_t err = ESP_ERR_NO_MEM;
+    uint8_t *buf = tx_frame_alloc(if_type, total, &free_fn, &err);
+    if (!buf) return err;
 
     memcpy(buf + eh_frame_hdr_size(), payload, payload_len);
 
@@ -75,7 +105,7 @@ static esp_err_t transport_tx(uint8_t if_type, uint8_t if_num, uint8_t pkt_type,
         .payload            = buf + eh_frame_hdr_size(),
         .payload_len        = payload_len,
         .payload_zcopy      = 0,
-        .free_buf_handle    = eh_host_port_dma_free,
+        .free_buf_handle    = free_fn,
     };
     eh_frame_encode(buf, &bh, payload_len);
     int rc = eh_host_mcu_transport_tx(&bh);
@@ -83,7 +113,7 @@ static esp_err_t transport_tx(uint8_t if_type, uint8_t if_num, uint8_t pkt_type,
         return ESP_OK;
     }
     if (if_type == ESP_STA_IF || if_type == ESP_AP_IF) {
-        return netif_tx_failed();
+        return EH_TX_BACKOFF_ERR;
     }
     return ESP_FAIL;
 }
