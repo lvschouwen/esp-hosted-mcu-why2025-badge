@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -29,7 +30,6 @@ static volatile uint8_t s_tx_task_running;
 static eh_host_port_task_t *s_tx_task;
 static uint32_t s_raw_tp_timer_count;
 static esp_timer_handle_t s_raw_tp_timer;
-static uint8_t s_tx_buf[EH_HOST_PORT_RAW_TP_PKT_LEN];
 /* Runtime direction (ESP_TEST_RAW_TP__* bits). The engine is compiled in but
  * stays idle until the host CLI selects a mode at runtime. */
 static volatile uint8_t s_raw_tp_dir = EH_HOST_PORT_TEST_RAW_TP_DIR;
@@ -57,12 +57,19 @@ static void raw_tp_tx_task(void *arg)
 {
     (void)arg;
 
-    memset(s_tx_buf, 0, sizeof(s_tx_buf));
-    for (size_t i = 0; i + 4 <= sizeof(s_tx_buf); i += 4) {
-        s_tx_buf[i + 0] = 0xBA;
-        s_tx_buf[i + 1] = 0xAD;
-        s_tx_buf[i + 2] = 0xF0;
-        s_tx_buf[i + 3] = 0x0D;
+    /* Owned by this task: allocated when a test starts, freed when it ends,
+     * so an idle engine holds no RAM (eh_host_transport_tx copies it). */
+    uint8_t *tx_buf = calloc(1, EH_HOST_PORT_RAW_TP_PKT_LEN);
+    if (!tx_buf) {
+        ESP_LOGE(TAG, "No memory for the raw throughput TX buffer");
+        s_tx_task_running = 0;
+        return;
+    }
+    for (size_t i = 0; i + 4 <= EH_HOST_PORT_RAW_TP_PKT_LEN; i += 4) {
+        tx_buf[i + 0] = 0xBA;
+        tx_buf[i + 1] = 0xAD;
+        tx_buf[i + 2] = 0xF0;
+        tx_buf[i + 3] = 0x0D;
     }
 
     for (int i = 0; i < 5000 && s_test_raw_tp_active; i += 10) {
@@ -75,7 +82,7 @@ static void raw_tp_tx_task(void *arg)
             continue;
         }
 
-        if (eh_host_transport_tx(ESP_TEST_IF, 0, s_tx_buf,
+        if (eh_host_transport_tx(ESP_TEST_IF, 0, tx_buf,
                                  EH_HOST_PORT_RAW_TP_PKT_LEN, 0) == ESP_OK) {
             s_test_raw_tx_len += EH_HOST_PORT_RAW_TP_PKT_LEN;
         } else {
@@ -87,6 +94,7 @@ static void raw_tp_tx_task(void *arg)
             eh_host_port_task_delay_ms(1);
         }
     }
+    free(tx_buf);
     s_tx_task_running = 0;
 }
 
