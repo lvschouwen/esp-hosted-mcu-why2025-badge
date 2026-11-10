@@ -403,13 +403,41 @@ if ESP_HOSTED_HOST_TRANSPORT_BUS_SDIO
 			the test suite to prove aggregation isn't bypassed. Keep
 			DISABLED in production.
 
+	config ESP_HOSTED_HOST_SDIO_FRAME_POOLS
+		bool "Fixed Wi-Fi frame pools in internal DMA RAM"
+		default y
+		help
+			Wi-Fi data frames (STA/AP) take their buffers from two fixed
+			pools reserved at link-up and freed at link-down, instead of a
+			DMA malloc per frame. The pool depths are the TX and RX queue
+			sizes below. Cost: TX depth x 1600 B + RX depth x 1536 B of
+			internal DMA RAM, plus one 1536 B TX stream buffer (depth 10:
+			about 32.9 KB). Control frames (RPC, HCI) stay on the heap.
+			Off: the per-frame malloc path.
+
+	config ESP_HOSTED_HOST_SDIO_TX_POOL_WAIT_MS
+		int "TX: wait for a free frame (ms)"
+		depends on ESP_HOSTED_HOST_SDIO_FRAME_POOLS
+		range 0 50
+		default 5
+		help
+			How long a Wi-Fi sender waits when the TX pool is empty before
+			the frame fails with ESP_ERR_ESP_NETIF_TX_FAILED, so lwIP backs
+			off. Counted as waits and drops in the pool stats.
+
 	config ESP_HOSTED_HOST_SDIO_TX_Q_SIZE
 		int "Host SDIO Tx queue size"
+		range 1 64 if ESP_HOSTED_HOST_SDIO_FRAME_POOLS
 		default 20
+		help
+			With frame pools on, also the TX pool depth.
 
 	config ESP_HOSTED_HOST_SDIO_RX_Q_SIZE
 		int "Host SDIO Rx queue size"
+		range 1 64 if ESP_HOSTED_HOST_SDIO_FRAME_POOLS
 		default 20
+		help
+			With frame pools on, also the RX pool depth.
 
 	config ESP_HOSTED_HOST_SDIO_RX_STAGING_SLOTS
 		int "Host SDIO RX staging slots"

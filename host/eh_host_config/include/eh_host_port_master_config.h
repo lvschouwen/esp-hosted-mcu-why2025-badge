@@ -629,11 +629,8 @@
   #error "No Slave Target or more than one Slave Target was defined."
 #endif
 
-#if CONFIG_ESP_HOSTED_USE_MEMPOOL
-  #define EH_HOST_PORT_USE_MEMPOOL 1
-#else
-  #define EH_HOST_PORT_USE_MEMPOOL 0
-#endif
+/* No host mempool switch: the SDIO host's fixed frame pools are
+ * CONFIG_ESP_HOSTED_HOST_SDIO_FRAME_POOLS (Lichen #260). */
 
 #define EH_HOST_PORT_FREE_PTR_WITH_FUNC(FreeFunc, FreePtr) do {    \
   if (FreeFunc && FreePtr) {             \

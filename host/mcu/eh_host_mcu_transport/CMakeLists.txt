@@ -16,6 +16,8 @@ set(EH_TRANSPORT_SRCS
     "src/eh_host_mcu_transport_init_event.c"
     "src/eh_host_mcu_transport_send_caps.c"
     "src/eh_host_mcu_hci.c"
+    "src/eh_host_frame_pool.c"
+    "src/eh_frame_pool_core.c"
 )
 
 if(CONFIG_ESP_HOSTED_HOST_TRANSPORT_BUS_SPI_READY)
@@ -36,6 +38,8 @@ add_library(eh_host_mcu_transport STATIC ${EH_TRANSPORT_SRCS})
 target_include_directories(eh_host_mcu_transport
     PUBLIC "include"
     PRIVATE "src"
+    # esp_hosted_frame_pool.h: the frame pool stats are part of the public surface
+    PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../../compat/include"
 )
 
 target_link_libraries(eh_host_mcu_transport
