@@ -30,6 +30,7 @@ target_link_options(esp_wifi_remote_glue INTERFACE
     "LINKER:--undefined=eh_wifi_remote_glue_anchor"
     "LINKER:--undefined=eh_wifi_remote_extended_anchor"
     "LINKER:--undefined=eh_wifi_he_with_hosted_anchor"
+    "LINKER:--undefined=eh_eap_dpp_with_hosted_anchor"
 )
 
 foreach(_feat wifi_ext_itwt wifi_ext_ent wifi_ext_dpp)

@@ -16,6 +16,9 @@
 #include "eh_host_wifi_ent.h"
 #endif
 
+/* Every symbol here has a weak twin in esp_wifi, so nothing pulls this member in on its own (Lichen #511) */
+const char eh_eap_dpp_with_hosted_anchor = 0;
+
 #if EH_HOST_FEAT_WIFI_EXT_DPP_READY
 #include "eh_host_wifi_dpp.h"
 #endif
