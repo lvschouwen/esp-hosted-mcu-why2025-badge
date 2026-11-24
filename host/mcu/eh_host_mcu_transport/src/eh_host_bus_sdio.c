@@ -335,7 +335,10 @@ typedef struct {
 /* Guards the head slot from the start of a read to the moment it is staged
  * (count++) or dropped, so the idle release never frees a slot a read is
  * filling or has filled but not yet handed over. Only trylocked by the
- * releaser (parse task), so it adds no lock-order cycle with sdio_bus_lock. */
+ * releaser (parse task), so it adds no lock-order cycle with sdio_bus_lock.
+ * Order: bus lock -> slot mutex on the read path, slot mutex -> bus lock in
+ * the memory-retry loop. No cycle: the releaser only trylocks the slot mutex
+ * and never takes the bus lock. */
 static eh_host_port_mutex_t *sdio_rx_slot_mtx;
 
 static double_buf_t double_buf;
@@ -1519,6 +1522,17 @@ static bool sdio_rx_holds_over_floor(void)
 	return false;
 }
 
+/* Unlock after a read that grew a slot but did not stage it. The parse task
+ * may be parked without a timeout (it judged the holds before the growth);
+ * wake it so it re-judges. With count <= 0 it does nothing else (it
+ * `continue`s before touching a slot or count). */
+static void sdio_rx_slot_unlock_wake(void)
+{
+	eh_host_port_mutex_unlock(sdio_rx_slot_mtx);
+	if (s_running && sem_double_buf_xfer_data)
+		eh_host_port_sem_post(sem_double_buf_xfer_data);
+}
+
 /* Parse task, after the link was quiet. With the slot mutex held sdio_read is
  * not between get_buffer and staging; count == 0 (acquire) means every slot
  * has been parsed and the parse task (us) is done with it. So no slot is in
@@ -1883,14 +1897,14 @@ static void sdio_read_task(void *pvParameters)
 			 * read would stall RX for good. Wait for memory and read it then. */
 			ESP_LOGW(TAG, "rx_get_buffer(%lu) failed; waiting for memory",
 			         (unsigned long)len_from_slave);
-			eh_host_port_mutex_unlock(sdio_rx_slot_mtx);
+			sdio_rx_slot_unlock_wake();
 			SDIO_DRV_UNLOCK();
 			while (s_running) {
 				eh_host_port_mutex_lock(sdio_rx_slot_mtx);
 				rxbuff = sdio_rx_get_buffer(len_from_slave);
 				if (rxbuff)
 					break;
-				eh_host_port_mutex_unlock(sdio_rx_slot_mtx);
+				sdio_rx_slot_unlock_wake();
 				eh_host_port_task_delay_ms(SDIO_RX_BUF_RETRY_MS);
 			}
 			if (!rxbuff)
@@ -1933,7 +1947,7 @@ static void sdio_read_task(void *pvParameters)
 		sdio_rx_byte_count = sdio_rx_byte_count % ESP_RX_BYTE_MAX;
 
 		if (unlikely(ret)) {
-			eh_host_port_mutex_unlock(sdio_rx_slot_mtx);
+			sdio_rx_slot_unlock_wake();
 			continue;
 		}
 
@@ -1952,6 +1966,7 @@ static void sdio_read_task(void *pvParameters)
 			__atomic_fetch_add(&double_buf.count, 1, __ATOMIC_ACQ_REL);
 			if (s_running && sem_double_buf_xfer_data)
 				eh_host_port_sem_post(sem_double_buf_xfer_data);
+			eh_host_port_mutex_unlock(sdio_rx_slot_mtx);
 		} else {
 			sdio_rx_free_buffer(rxbuff);
 #if EH_HOST_PORT_SDIO_HOST_RX_MODE != EH_HOST_PORT_SDIO_HOST_STREAMING_MODE
@@ -1959,12 +1974,13 @@ static void sdio_read_task(void *pvParameters)
 			 * can't double-free it. Mirrors the drain-task clear. */
 			double_buf.buffer[double_buf.head].buf = NULL;
 #endif
-			if (s_running)
+			if (s_running) {
 				ESP_LOGE(TAG, "Rx slot busy, dropped #%lu (drain stalled)",
 				         (unsigned long)(++sdio_rx_slot_drops));
+			}
+			sdio_rx_slot_unlock_wake();
 		}
-		eh_host_port_mutex_unlock(sdio_rx_slot_mtx);
-		}
+	}
 }
 
 static void sdio_process_rx_task(void *pvParameters)
