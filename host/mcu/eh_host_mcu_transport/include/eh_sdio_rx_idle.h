@@ -25,7 +25,7 @@
 /* Release only when the link was quiet for the whole threshold and no slot is
  * staged for the parse task (pending == 0), else a slot could be freed under
  * the parser. */
-static inline bool eh_sdio_rx_release_due(uint32_t pending, uint32_t quiet_ms)
+static inline bool eh_sdio_rx_release_due(int pending, uint32_t quiet_ms)
 {
 	return pending == 0 && quiet_ms >= EH_SDIO_RX_IDLE_MS;
 }
@@ -33,6 +33,27 @@ static inline bool eh_sdio_rx_release_due(uint32_t pending, uint32_t quiet_ms)
 static inline bool eh_sdio_rx_slot_over_floor(size_t buf_size)
 {
 	return buf_size > EH_SDIO_RX_KEEP_FLOOR;
+}
+
+/* Which of the n slots (size 0 = nothing allocated) to free now: bit i of
+ * *free_mask. Returns the bytes those slots hold; 0 and an empty mask when the
+ * release is not due. The caller frees and clears the slots it is told to. */
+static inline size_t eh_sdio_rx_release_plan(const size_t *sizes, unsigned n,
+					     int pending, uint32_t quiet_ms,
+					     uint32_t *free_mask)
+{
+	size_t bytes = 0;
+
+	*free_mask = 0;
+	if (!eh_sdio_rx_release_due(pending, quiet_ms))
+		return 0;
+	for (unsigned i = 0; i < n && i < 32; i++) {
+		if (eh_sdio_rx_slot_over_floor(sizes[i])) {
+			*free_mask |= 1u << i;
+			bytes += sizes[i];
+		}
+	}
+	return bytes;
 }
 
 #endif
