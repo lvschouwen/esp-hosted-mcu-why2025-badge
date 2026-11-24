@@ -24,6 +24,7 @@
 #include "eh_mempool.h"
 #include "eh_transport_utils.h"
 #include "eh_common.h"
+#include "eh_sdio_rx_idle.h"
 #include "eh_common_log.h"
 #include "eh_check.h"
 
@@ -1575,6 +1576,36 @@ static void sdio_rx_free_buffer(uint8_t * buf)
 	/* no-op: keep the static buffer allocated. */
 }
 
+/* Any staging slot above the keep floor? Decides whether the read task needs
+ * an idle timeout at all (no wakeups when nothing is held). */
+static bool sdio_rx_holds_over_floor(void)
+{
+	for (int i = 0; i < SDIO_RX_STAGING_SLOTS; i++)
+		if (double_buf.buffer[i].buf &&
+		    eh_sdio_rx_slot_over_floor(double_buf.buffer[i].buf_size))
+			return true;
+	return false;
+}
+
+/* Called by sdio_read_task (the only task that grows or fills slots) after the
+ * link was quiet. count == 0 means the parse task has finished with every slot
+ * (it decrements count last and never touches a slot again), and only this
+ * task can stage a new one, so freeing here cannot race a read or a parse. */
+static void sdio_rx_release_idle(uint32_t quiet_ms)
+{
+	__sync_synchronize();
+	if (!eh_sdio_rx_release_due((uint32_t)double_buf.count, quiet_ms))
+		return;
+	for (int i = 0; i < SDIO_RX_STAGING_SLOTS; i++) {
+		buf_info_t *b = &double_buf.buffer[i];
+		if (b->buf && eh_sdio_rx_slot_over_floor(b->buf_size)) {
+			eh_host_port_dma_free(b->buf);
+			b->buf = NULL;
+			b->buf_size = 0;
+		}
+	}
+}
+
 static esp_err_t sdio_streaming_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 {
 	uint8_t * pkt_rxbuff = NULL;
@@ -1797,7 +1828,11 @@ static void sdio_read_task(void *pvParameters)
 	while (s_running) {
 
 		ESP_LOGD(TAG, "--- Wait for SDIO intr ---");
-		res = eh_host_port_sdio_wait_slave_intr(sdio_handle, EH_HOST_PORT_WAIT_FOREVER);
+		/* Bounded wait only while big slots are held, so they can be released
+		 * when the link goes quiet (#555); otherwise sleep as before. */
+		res = eh_host_port_sdio_wait_slave_intr(sdio_handle,
+			sdio_rx_holds_over_floor() ?
+			pdMS_TO_TICKS(EH_SDIO_RX_IDLE_MS) : EH_HOST_PORT_WAIT_FOREVER);
 		ESP_LOGD(TAG, "--- SDIO intr received ---");
 
 		if (!s_running) {
@@ -1805,6 +1840,7 @@ static void sdio_read_task(void *pvParameters)
 		}
 		if (res != ESP_OK) {
 			if (res == ESP_ERR_TIMEOUT) {
+				sdio_rx_release_idle(EH_SDIO_RX_IDLE_MS);
 				continue;
 			}
 			ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
