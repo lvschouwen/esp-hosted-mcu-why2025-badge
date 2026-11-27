@@ -36,12 +36,13 @@ static inline uint32_t eh_sdio_rx_round(uint32_t len, uint32_t block)
 }
 
 /* The largest read accepted: the INIT target when there is one (already
- * rounded by the caller), else the protocol maximum. */
+ * rounded by the caller), never above the protocol maximum, so a hostile or
+ * corrupt INIT cannot raise the cap; with no target, the maximum itself. */
 static inline uint32_t eh_sdio_rx_cap(uint32_t target, uint32_t frame_bytes, uint32_t block)
 {
-	if (target)
-		return target;
-	return eh_sdio_rx_round(frame_bytes * EH_SDIO_RX_STREAM_MAX_FRAMES, block);
+	uint32_t max = eh_sdio_rx_round(frame_bytes * EH_SDIO_RX_STREAM_MAX_FRAMES, block);
+
+	return (target && target < max) ? target : max;
 }
 
 /* What to do with a read of len bytes: over the cap fails at once, whatever

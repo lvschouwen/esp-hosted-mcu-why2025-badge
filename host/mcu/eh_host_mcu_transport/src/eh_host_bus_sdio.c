@@ -2352,6 +2352,14 @@ void eh_host_bus_sdio_set_rx_staging_target(uint32_t target_size)
 #if EH_HOST_PORT_SDIO_RX_BLOCK_ONLY_XFER
 	target_size = ((target_size + ESP_BLOCK_SIZE - 1) / ESP_BLOCK_SIZE) * ESP_BLOCK_SIZE;
 #endif
+	/* Clamped here too, so PREALLOC never reserves more than the read cap
+	 * would accept (a hostile or corrupt INIT, Lichen #371). */
+	uint32_t clamped = eh_sdio_rx_cap(target_size, ESP_RX_BUFFER_SIZE, SDIO_RX_BLOCK);
+	if (clamped != target_size) {
+		ESP_LOGW(TAG, "INIT advertises %lu B RX aggregates; capped at %lu B",
+		         (unsigned long)target_size, (unsigned long)clamped);
+		target_size = clamped;
+	}
 
 	SDIO_DRV_LOCK();
 #if SDIO_RX_PREALLOC
