@@ -206,6 +206,28 @@ static void show_config(void)
 #define SDIO_FRAMES_IN_PSRAM 0
 #endif
 
+/* RX staging sizing (Lichen #371). Two models, never both:
+ * - SDIO_RX_PREALLOC (upstream): at INIT every slot is grown once to the
+ *   co-processor's advertised aggregate (14 x 1536 B in stream mode) and kept
+ *   for the life of the link; a larger read is a link failure.
+ * - SDIO_RX_IDLE_RELEASE (Lichen #555, the default): slots grow on demand and
+ *   are handed back once the link is quiet, so nothing big stays in internal
+ *   DMA RAM at rest. Freeing a slot would break the preallocation contract,
+ *   hence the compile-time split. Needs 2+ slots (the release runs in the
+ *   parse task while the read task owns the only slot otherwise). */
+#if (EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE) && \
+    defined(CONFIG_ESP_HOSTED_HOST_SDIO_RX_STAGING_PREALLOC)
+#define SDIO_RX_PREALLOC 1
+#else
+#define SDIO_RX_PREALLOC 0
+#endif
+#if (EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE) && \
+    !SDIO_RX_PREALLOC && (EH_HOST_PORT_SDIO_RX_STAGING_SLOTS > 1)
+#define SDIO_RX_IDLE_RELEASE 1
+#else
+#define SDIO_RX_IDLE_RELEASE 0
+#endif
+
 static void *sdio_dma_alloc_internal(size_t n, size_t align)
 {
 #ifdef ESP_PLATFORM
@@ -225,6 +247,13 @@ static void *sdio_frame_copy_alloc(size_t n)
 		return p;
 #endif
 	return malloc(n);
+}
+
+/* Frees a sdio_frame_copy_alloc buffer: always the heap, never the SDIO
+ * mempool (sdio_buffer_free would hand it to the pool when that is on). */
+static void sdio_frame_copy_free(void *p)
+{
+	free(p);
 }
 
 static inline bool sdio_ptr_in_psram(const void *p)
@@ -399,7 +428,7 @@ static void sdio_write_task(void *pvParameters);
 static void sdio_read_task(void *pvParameters);
 static void sdio_process_rx_task(void *pvParameters);
 static void sdio_rx_free_buffer(uint8_t *buf);
-#if EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE
+#if SDIO_RX_PREALLOC
 static int sdio_prealloc_pending_rx_slots(void);
 #endif
 
@@ -498,7 +527,7 @@ static inline void *sdio_rx_frame_alloc(uint8_t if_type, void (**free_fn)(void *
 	void *p = sdio_frame_copy_alloc(MAX_SDIO_BUFFER_SIZE);
 	if (p)
 		memset(p, 0, MAX_SDIO_BUFFER_SIZE);
-	*free_fn = sdio_buffer_free;
+	*free_fn = sdio_frame_copy_free;
 	return p;
 }
 
@@ -1561,14 +1590,28 @@ static uint8_t * sdio_rx_get_buffer(uint32_t len)
 	uint8_t ** buf = &double_buf.buffer[index].buf;
 
 	if (len > double_buf.buffer[index].buf_size) {
+#if SDIO_RX_PREALLOC
 		/* A completed target is the CP's contract for every subsequent
-		 * aggregate. Do not silently resize after a staging hand-off. */
+		 * aggregate. Do not silently resize after a staging hand-off. The
+		 * read task checks this first (sdio_rx_read_over_target), so a NULL
+		 * from here is always an allocation failure. */
 		if (sdio_rx_staging_prealloc_done) {
 			ESP_LOGE(TAG, "SDIO RX read (%lu bytes) exceeds staging target (%lu bytes)",
 			         (unsigned long)len,
 			         (unsigned long)double_buf.buffer[index].buf_size);
 			return NULL;
 		}
+#else
+		/* Grow on demand. The INIT target is only a diagnostic here: an older
+		 * co-processor may advertise less than it queues (Lichen #371). */
+		static bool over_target_logged;
+		if (sdio_rx_staging_target_size && len > sdio_rx_staging_target_size &&
+		    !over_target_logged) {
+			ESP_LOGW(TAG, "SDIO RX read (%lu B) above the advertised %lu B; growing",
+			         (unsigned long)len, (unsigned long)sdio_rx_staging_target_size);
+			over_target_logged = true;
+		}
+#endif
 		if (*buf) {
 			eh_host_port_dma_free(*buf);
 			*buf = NULL;
@@ -1591,6 +1634,20 @@ static void sdio_rx_free_buffer(uint8_t * buf)
 	/* no-op: keep the static buffer allocated. */
 }
 
+#if SDIO_RX_PREALLOC
+/* A read the preallocated slots cannot take: the co-processor broke the size
+ * it advertised at INIT. Not an out-of-memory, so no point waiting for one. */
+static bool sdio_rx_read_over_target(uint32_t len)
+{
+#if EH_HOST_PORT_SDIO_RX_BLOCK_ONLY_XFER
+	len = ((len + ESP_BLOCK_SIZE - 1) / ESP_BLOCK_SIZE) * ESP_BLOCK_SIZE;
+#endif
+	return sdio_rx_staging_prealloc_done &&
+	       len > double_buf.buffer[double_buf.head].buf_size;
+}
+#endif
+
+#if SDIO_RX_IDLE_RELEASE
 /* Any staging slot above the keep floor? Decides whether the parse task needs
  * an idle timeout at all (no wakeups when nothing is held). Racy read is fine:
  * it is re-evaluated after every drained slot, and growth is always followed
@@ -1604,6 +1661,8 @@ static bool sdio_rx_holds_over_floor(void)
 	return false;
 }
 
+#endif /* SDIO_RX_IDLE_RELEASE */
+
 /* Unlock after a read that grew a slot but did not stage it. The parse task
  * may be parked without a timeout (it judged the holds before the growth);
  * wake it so it re-judges. With count <= 0 it does nothing else (it
@@ -1615,6 +1674,7 @@ static void sdio_rx_slot_unlock_wake(void)
 		eh_host_port_sem_post(sem_double_buf_xfer_data);
 }
 
+#if SDIO_RX_IDLE_RELEASE
 /* Parse task, after the link was quiet. With the slot mutex held sdio_read is
  * not between get_buffer and staging; count == 0 (acquire) means every slot
  * has been parsed and the parse task (us) is done with it. So no slot is in
@@ -1644,6 +1704,7 @@ static void sdio_rx_release_idle(uint32_t quiet_ms)
 	if (bytes)
 		ESP_LOGI(TAG, "rx idle: released %u B of staging", (unsigned)bytes);
 }
+#endif /* SDIO_RX_IDLE_RELEASE */
 
 static esp_err_t sdio_streaming_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 {
@@ -1746,15 +1807,21 @@ static void sdio_data_to_rx_buf_task(void *pvParameters)
 	while (s_running) {
 		/* Bounded wait only while big slots are held: a full idle period
 		 * with nothing staged hands them back (#555). */
+#if SDIO_RX_IDLE_RELEASE
 		eh_host_port_err_t wr = eh_host_port_sem_wait_ms(sem_double_buf_xfer_data,
 			sdio_rx_holds_over_floor() ? EH_SDIO_RX_IDLE_MS : EH_HOST_PORT_WAIT_FOREVER);
+#else
+		eh_host_port_sem_wait_ms(sem_double_buf_xfer_data, EH_HOST_PORT_WAIT_FOREVER);
+#endif
 		if (!s_running) {
 			break;
 		}
+#if SDIO_RX_IDLE_RELEASE
 		if (wr == EH_HOST_PORT_ERR_TIMEOUT) {
 			sdio_rx_release_idle(EH_SDIO_RX_IDLE_MS);
 			continue;
 		}
+#endif
 
 		if (double_buf.count <= 0) {
 			ESP_LOGD(TAG, "double buf idle (count=%d)", double_buf.count);
@@ -1948,7 +2015,7 @@ static void sdio_read_task(void *pvParameters)
 		}
 #endif
 
-#if EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE
+#if SDIO_RX_PREALLOC
 		/* INIT may have arrived while an earlier aggregate was still being
 		 * drained.  Before the next CMD53, wait for every published slot to
 		 * drain, then resize all slots as their sole owner. */
@@ -1985,6 +2052,14 @@ static void sdio_read_task(void *pvParameters)
 				eh_host_port_task_delay_ms(1000);
 		}
 		SDIO_DRV_LOCK();
+#endif
+
+#if SDIO_RX_PREALLOC
+		if (sdio_rx_read_over_target(len_from_slave)) {
+			SDIO_DRV_UNLOCK();
+			sdio_link_failed("SDIO RX read exceeds the preallocated staging slot");
+			continue;
+		}
 #endif
 
 		eh_host_port_mutex_lock(sdio_rx_slot_mtx);
@@ -2213,7 +2288,7 @@ static void sdio_process_rx_task(void *pvParameters)
 	}
 }
 
-#if EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE
+#if SDIO_RX_PREALLOC
 /* Grow one streaming slot. Never shrinks. Allocates the replacement before
  * freeing the old buffer, so a failure leaves the slot unchanged. */
 static int sdio_grow_rx_slot(buf_info_t *slot, uint32_t new_size)
@@ -2254,6 +2329,7 @@ void eh_host_bus_sdio_set_rx_staging_target(uint32_t target_size)
 #endif
 
 	SDIO_DRV_LOCK();
+#if SDIO_RX_PREALLOC
 	/* INIT normally runs once. If a later INIT advertises a larger aggregate,
 	 * safely schedule one more read-owned grow; a smaller target needs none. */
 	if (!sdio_rx_staging_prealloc_done ||
@@ -2262,11 +2338,15 @@ void eh_host_bus_sdio_set_rx_staging_target(uint32_t target_size)
 		sdio_rx_staging_prealloc_pending = true;
 		sdio_rx_staging_prealloc_done = false;
 	}
+#else
+	/* Slots grow on demand (Lichen #555); the target is only logged against. */
+	sdio_rx_staging_target_size = target_size;
+#endif
 	SDIO_DRV_UNLOCK();
  #endif
 }
 
-#if EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE
+#if SDIO_RX_PREALLOC
 /* Called by sdio_read_task with SDIO_DRV_LOCK held and count == 0. */
 static int sdio_prealloc_pending_rx_slots(void)
 {
