@@ -17,6 +17,11 @@ extern "C" {
 
 #define EH_SDIO_CFG_BUF_BLOCK  512u  /* bufsz fields are in 512-byte units */
 
+/* Stream mode: frames the CP keeps in flight, so the most one host read can
+ * drain. The CP sizes its send queue with it, the host caps every RX read at
+ * it (Lichen #371): one define so the two cannot drift. */
+#define EH_SDIO_STREAM_QUEUE_SIZE  14
+
 enum eh_sdio_cfg_transport {
     EH_SDIO_CFG_TPORT_SDIO = 0,
     EH_SDIO_CFG_TPORT_SPI  = 1,

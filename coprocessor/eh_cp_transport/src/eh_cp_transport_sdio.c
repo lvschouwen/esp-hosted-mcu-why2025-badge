@@ -111,7 +111,7 @@ static const uint16_t to_host_q_depth[MAX_PRIORITY_QUEUES] = {
 #define SDIO_HDR_SIZE             (sizeof(struct esp_payload_header))
 
 #if TX_MODE == TX_MODE_STREAM
-#define SDIO_STREAM_QUEUE_SIZE    14    /* STREAM in-flight frames; advertised to the host */
+#define SDIO_STREAM_QUEUE_SIZE    EH_SDIO_STREAM_QUEUE_SIZE  /* STREAM in-flight frames; advertised to the host */
 #define SDIO_DRIVER_TX_QUEUE_SIZE SDIO_STREAM_QUEUE_SIZE
 #define SDIO_TX_BUFFER_SIZE       1536  /* one MTU frame + header (fits 1460 raw-TP too) */
 #define SDIO_TX_MEMPOOL_MARGIN    4     /* pool slack over in-flight depth */

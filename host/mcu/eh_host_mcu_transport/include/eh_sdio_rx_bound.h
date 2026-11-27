@@ -13,10 +13,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Frames one stream-mode read can drain: the co-processor's in-flight depth
- * (SDIO_STREAM_QUEUE_SIZE, 14 in 3.0.10 and in main). The cap when INIT
- * advertised no aggregate (an older co-processor sends no TX_Q_SIZE). */
-#define EH_SDIO_RX_STREAM_MAX_FRAMES  14u
+#include "eh_common_sdio_cfg.h"
+
+/* Frames one stream-mode read can drain: the co-processor's in-flight depth,
+ * shared with the CP. The cap when INIT advertises no aggregate, and the clamp
+ * on one that is larger: a 3.0.10 C6 advertises its configured TX queue size
+ * (default 20, so 30720 B) while it keeps at most 14 frames in flight, and the
+ * clamp is what keeps a new P4 with that C6 at 21504 B (with a warning). */
+#define EH_SDIO_RX_STREAM_MAX_FRAMES  ((uint32_t)EH_SDIO_STREAM_QUEUE_SIZE)
 
 /* Total time a read may wait for its staging buffer before the link fails.
  * Long enough for a burst of other allocations to drain, short enough that a
@@ -29,10 +33,14 @@ typedef enum {
 	EH_SDIO_RX_FAIL,	/* fail the link: never allocate or wait */
 } eh_sdio_rx_step_t;
 
-/* len rounded up to whole blocks; block 0 = byte-mode reads. */
+/* len rounded up to whole blocks; block 0 = byte-mode reads. Saturates at
+ * UINT32_MAX instead of wrapping to a small value that would pass the cap. */
 static inline uint32_t eh_sdio_rx_round(uint32_t len, uint32_t block)
 {
-	return block ? (uint32_t)(((uint64_t)len + block - 1) / block * block) : len;
+	if (!block)
+		return len;
+	uint64_t r = ((uint64_t)len + block - 1) / block * block;
+	return r > UINT32_MAX ? UINT32_MAX : (uint32_t)r;
 }
 
 /* The largest read accepted: the INIT target when there is one (already
