@@ -25,6 +25,7 @@
 #include "eh_transport_utils.h"
 #include "eh_common.h"
 #include "eh_sdio_rx_idle.h"
+#include "eh_sdio_rx_bound.h"
 #include "eh_common_log.h"
 #include "eh_check.h"
 
@@ -1593,23 +1594,13 @@ static uint8_t * sdio_rx_get_buffer(uint32_t len)
 #if SDIO_RX_PREALLOC
 		/* A completed target is the CP's contract for every subsequent
 		 * aggregate. Do not silently resize after a staging hand-off. The
-		 * read task checks this first (sdio_rx_read_over_target), so a NULL
-		 * from here is always an allocation failure. */
+		 * read task's cap (sdio_rx_read_cap) already refuses such a read;
+		 * this stays as the last line. */
 		if (sdio_rx_staging_prealloc_done) {
 			ESP_LOGE(TAG, "SDIO RX read (%lu bytes) exceeds staging target (%lu bytes)",
 			         (unsigned long)len,
 			         (unsigned long)double_buf.buffer[index].buf_size);
 			return NULL;
-		}
-#else
-		/* Grow on demand. The INIT target is only a diagnostic here: an older
-		 * co-processor may advertise less than it queues (Lichen #371). */
-		static bool over_target_logged;
-		if (sdio_rx_staging_target_size && len > sdio_rx_staging_target_size &&
-		    !over_target_logged) {
-			ESP_LOGW(TAG, "SDIO RX read (%lu B) above the advertised %lu B; growing",
-			         (unsigned long)len, (unsigned long)sdio_rx_staging_target_size);
-			over_target_logged = true;
 		}
 #endif
 		if (*buf) {
@@ -1634,18 +1625,6 @@ static void sdio_rx_free_buffer(uint8_t * buf)
 	/* no-op: keep the static buffer allocated. */
 }
 
-#if SDIO_RX_PREALLOC
-/* A read the preallocated slots cannot take: the co-processor broke the size
- * it advertised at INIT. Not an out-of-memory, so no point waiting for one. */
-static bool sdio_rx_read_over_target(uint32_t len)
-{
-#if EH_HOST_PORT_SDIO_RX_BLOCK_ONLY_XFER
-	len = ((len + ESP_BLOCK_SIZE - 1) / ESP_BLOCK_SIZE) * ESP_BLOCK_SIZE;
-#endif
-	return sdio_rx_staging_prealloc_done &&
-	       len > double_buf.buffer[double_buf.head].buf_size;
-}
-#endif
 
 #if SDIO_RX_IDLE_RELEASE
 /* Any staging slot above the keep floor? Decides whether the parse task needs
@@ -1785,6 +1764,60 @@ static esp_err_t sdio_streaming_push_data_to_queue(uint8_t * buf, uint32_t buf_l
 	return ESP_OK;
 }
 #endif
+
+#if EH_HOST_PORT_SDIO_RX_BLOCK_ONLY_XFER
+#define SDIO_RX_BLOCK  ESP_BLOCK_SIZE
+#else
+#define SDIO_RX_BLOCK  0u
+#endif
+
+/* The largest read the slave may ask for (Lichen #371). PKT_LEN comes from the
+ * co-processor, so a corrupt or hostile length must not size an internal DMA
+ * allocation: stream mode takes the aggregate advertised at INIT (rounded
+ * there), else the protocol maximum; packet mode reads into one frame buffer. */
+static uint32_t sdio_rx_read_cap(void)
+{
+#if EH_HOST_PORT_SDIO_HOST_RX_MODE == EH_HOST_PORT_SDIO_HOST_STREAMING_MODE
+	uint32_t target = sdio_rx_staging_target_size;
+#else
+	uint32_t target = MAX_SDIO_BUFFER_SIZE;
+#endif
+	return eh_sdio_rx_cap(target, ESP_RX_BUFFER_SIZE, SDIO_RX_BLOCK);
+}
+
+/* Over the cap: fail the link, never allocate or wait (#371). */
+static void sdio_rx_fail_over_cap(uint32_t len, uint32_t cap)
+{
+	ESP_LOGE(TAG, "SDIO RX read of %lu B above the %lu B cap",
+	         (unsigned long)len, (unsigned long)cap);
+	sdio_link_failed("SDIO RX read above the cap");
+}
+
+/* With the slot mutex and the bus lock released: retry the staging buffer
+ * until it comes or the bounded wait runs out. Returns the buffer with the
+ * slot mutex held, or NULL with it released (link failed or shutting down). */
+static uint8_t *sdio_rx_wait_for_buffer(uint32_t len, uint32_t cap)
+{
+	uint32_t waited = 0;
+
+	while (s_running) {
+		eh_host_port_mutex_lock(sdio_rx_slot_mtx);
+		uint8_t *buf = sdio_rx_get_buffer(len);
+		eh_sdio_rx_step_t step = eh_sdio_rx_step(len, cap, SDIO_RX_BLOCK, buf != NULL, waited);
+		if (step == EH_SDIO_RX_READ)
+			return buf;
+		sdio_rx_slot_unlock_wake();
+		if (step == EH_SDIO_RX_FAIL) {
+			ESP_LOGE(TAG, "no %lu B for an SDIO RX read after %lu ms",
+			         (unsigned long)len, (unsigned long)waited);
+			sdio_link_failed("SDIO RX staging buffer not allocatable");
+			return NULL;
+		}
+		eh_host_port_task_delay_ms(SDIO_RX_BUF_RETRY_MS);
+		waited += SDIO_RX_BUF_RETRY_MS;
+	}
+	return NULL;
+}
 
 static esp_err_t sdio_rx_push_data_to_queue(uint8_t *buf, uint32_t buf_len)
 {
@@ -2054,32 +2087,24 @@ static void sdio_read_task(void *pvParameters)
 		SDIO_DRV_LOCK();
 #endif
 
-#if SDIO_RX_PREALLOC
-		if (sdio_rx_read_over_target(len_from_slave)) {
+		uint32_t rx_cap = sdio_rx_read_cap();
+		if (eh_sdio_rx_step(len_from_slave, rx_cap, SDIO_RX_BLOCK, true, 0) == EH_SDIO_RX_FAIL) {
 			SDIO_DRV_UNLOCK();
-			sdio_link_failed("SDIO RX read exceeds the preallocated staging slot");
+			sdio_rx_fail_over_cap(len_from_slave, rx_cap);
 			continue;
 		}
-#endif
 
 		eh_host_port_mutex_lock(sdio_rx_slot_mtx);
 		rxbuff = sdio_rx_get_buffer(len_from_slave);
 		if (!rxbuff) {
 			/* The NEW_PACKET interrupt for this data is already cleared, and the
 			 * slave raises no new one while the data stays unread: skipping the
-			 * read would stall RX for good. Wait for memory and read it then. */
+			 * read would stall RX for good. Wait for memory, bounded (#371). */
 			ESP_LOGW(TAG, "rx_get_buffer(%lu) failed; waiting for memory",
 			         (unsigned long)len_from_slave);
 			sdio_rx_slot_unlock_wake();
 			SDIO_DRV_UNLOCK();
-			while (s_running) {
-				eh_host_port_mutex_lock(sdio_rx_slot_mtx);
-				rxbuff = sdio_rx_get_buffer(len_from_slave);
-				if (rxbuff)
-					break;
-				sdio_rx_slot_unlock_wake();
-				eh_host_port_task_delay_ms(SDIO_RX_BUF_RETRY_MS);
-			}
+			rxbuff = sdio_rx_wait_for_buffer(len_from_slave, rx_cap);
 			if (!rxbuff)
 				continue;
 			ESP_LOGW(TAG, "rx_get_buffer(%lu) succeeded again", (unsigned long)len_from_slave);

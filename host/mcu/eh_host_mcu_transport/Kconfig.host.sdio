@@ -460,21 +460,38 @@ if ESP_HOSTED_HOST_TRANSPORT_BUS_SDIO
 			absorb RX bursts without stalling the slave, at the cost of
 			slots x max-aggregate DMA RAM. Tune on hardware.
 
-	config ESP_HOSTED_HOST_SDIO_RX_STAGING_PREALLOC
-		bool "Preallocate RX staging slots at INIT"
-		default n
+	choice ESP_HOSTED_HOST_SDIO_RX_STAGING_MODEL
+		prompt "Host SDIO RX staging buffers"
+		depends on ESP_HOSTED_HOST_SDIO_RX_STREAMING_MODE
+		default ESP_HOSTED_HOST_SDIO_RX_STAGING_ON_DEMAND
 		help
-			Stream mode only. On: when the INIT event arrives, every RX
-			staging slot is grown once to the aggregate the co-processor
-			advertises (14 x 1536 B for a stream-mode slave) and kept for
-			the life of the link; a larger read is a link failure. That
-			reserves slots x 21504 B of internal DMA RAM for good.
+			How the stream-mode RX staging slots get their internal DMA
+			RAM. The two models exclude each other: releasing a slot would
+			break the preallocation contract.
 
-			Off (Lichen #555): slots grow on demand and, with 2 or more
-			slots, are released once the link has been quiet for 250 ms,
-			so nothing large stays allocated at rest. A failed grow waits
-			for memory instead of dropping the read.
+			In both, a read above the cap (the aggregate the co-processor
+			advertises at INIT, else 14 x 1536 B) fails the link, and a
+			grow that finds no memory for about 1.5 s fails it too.
 
+		config ESP_HOSTED_HOST_SDIO_RX_STAGING_ON_DEMAND
+			bool "Grow on demand, release when quiet"
+			help
+				Slots grow to the read in hand and, with 2 or more
+				slots, are released once the link has been quiet for
+				250 ms (Lichen #555), so nothing large stays allocated
+				at rest. A failed grow waits for memory.
+
+		config ESP_HOSTED_HOST_SDIO_RX_STAGING_PREALLOC
+			bool "Preallocate at INIT"
+			help
+				When the INIT event arrives, every slot is grown once
+				to the advertised aggregate (14 x 1536 B for a
+				stream-mode slave) and kept for the life of the link.
+				That reserves slots x 21504 B of internal DMA RAM for
+				good; with RX_STAGING_SLOTS=1 it is 21504 B.
+	endchoice
+
+	config ESP_HOSTED_HOST_SDIO_USE_MEMPOOL
 		bool "Use a mempool for SDIO packet buffers"
 		default n
 		help
